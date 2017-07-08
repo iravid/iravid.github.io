@@ -1,0 +1,289 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en">
+    <head>
+        <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+        <title>Itamar's Blog - Using cats with reactive-kafka</title>
+        <link rel="stylesheet" type="text/css" href="../css/default.css" />
+        <link rel="stylesheet" type="text/css" href="../css/syntax.css" />
+    </head>
+    <body>
+        <div id="header">
+            <div id="logo">
+                <a href="../">Itamar's Blog</a>
+            </div>
+            <div id="navigation">
+                <a href="../">Home</a>
+                <a href="../archive.html">Archive</a>
+            </div>
+        </div>
+
+        <div id="content">
+            <h1>Using cats with reactive-kafka</h1>
+
+            <div class="info">
+    Posted on July  7, 2017
+    
+</div>
+
+<p>At <a href="https://bigpanda.io/">my current job</a>, we’re big fans of using Kafka to replicate data between services. In fact, Kafka is the single most important input mechanism for our services: we structure them using CQRS, so their internal state is determined entirely by the contents of the commands topic. To process these topics, we use Akka Streams, and specifically the wonderful <a href="https://github.com/akka/reactive-kafka"><code>reactive-kafka</code></a> library.</p>
+<p>Having written several services in this form, we realized that although Akka Streams and Reactive Kafka are very capable and expressive, we were still duplicating copious amounts of code: batch committing, structuring graphs for at-least-once processing, etc. Apart from that, we had some issues around conditionally producing to topics - I’ll touch that in a moment.</p>
+<p>To get this post going, I’d like to start with a motivating example showing how we use <code>reactive-kafka</code>.</p>
+<h1 id="a-motivating-example">A motivating example</h1>
+<p>To provide some context, we’re talking about a service that continually performs the following set of actions:</p>
+<ul>
+<li>Read a message from a Kafka topic</li>
+<li>Deserialize the JSON message (using play-json)</li>
+<li>Do some validation and convert the message to a result</li>
+<li>Write the result to a database</li>
+<li>Produce an output message to another topic</li>
+<li>Commit the offset of the original message</li>
+</ul>
+<p>These map nicely to an Akka Streams graph, so let’s see how that looks. First, some imports and definitions:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">import</span> akka.<span class="fu">Done</span>
+<span class="kw">import</span> akka.<span class="fu">stream</span>.<span class="fu">scaladsl</span>._
+<span class="kw">import</span> akka.<span class="fu">kafka</span>.{ 
+  ConsumerSettings =&gt; AkkaConsumerSettings, 
+  ProducerSettings =&gt; AkkaProducerSettings, 
+  _ 
+}
+<span class="kw">import</span> akka.<span class="fu">kafka</span>.<span class="fu">scaladsl</span>._
+<span class="kw">import</span> play.<span class="fu">api</span>.<span class="fu">libs</span>.<span class="fu">json</span>._
+<span class="kw">import</span> scala.<span class="fu">concurrent</span>.{ ExecutionContext, Future }
+
+<span class="co">// The data type we'll deserialize from Kafka</span>
+<span class="kw">case</span> <span class="kw">class</span> <span class="fu">Message</span>()
+<span class="kw">object</span> Message {
+  <span class="kw">implicit</span> <span class="kw">val</span> reads: Reads[Message] = ???
+}
+
+<span class="co">// The data type that will result from our validation</span>
+<span class="kw">case</span> <span class="kw">class</span> Result()
+<span class="kw">object</span> Result {
+  <span class="kw">def</span> <span class="fu">fromMessage</span>(msg: Message): Either[String, Result] = ???
+}
+
+<span class="co">// Some sort of storage mechanism</span>
+<span class="kw">trait</span> Database {
+  <span class="kw">def</span> <span class="fu">write</span>(result: Result): Future[Unit]
+}
+
+<span class="co">// We'll always be using byte arrays with Kafka, so there's no point in carrying around the</span>
+<span class="co">// big types provided by the library. We'll fix everything to byte arrays.</span>
+<span class="kw">type</span> ConsumerSettings = AkkaConsumerSettings[Array[Byte], Array[Byte]]
+<span class="kw">type</span> ProducerSettings = AkkaProducerSettings[Array[Byte], Array[Byte]]
+<span class="kw">type</span> CommittableMessage = ConsumerMessage.<span class="fu">CommittableMessage</span>[Array[Byte], Array[Byte]]
+<span class="kw">type</span> ProducerMessage[P] = ProducerMessage.<span class="fu">Message</span>[Array[Byte], Array[Byte], P]
+<span class="kw">type</span> ProducerResult[P] = ProducerMessage.<span class="fu">Result</span>[Array[Byte], Array[Byte], P]
+
+<span class="kw">def</span> <span class="fu">toProducerMessage</span>(kafkaMsg: CommittableMessage, result: Result, 
+  destTopic: String): ProducerMessage[CommittableMessage] = ???</code></pre></div>
+<p>And the graph itself:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">object</span> ProcessingGraph {
+  <span class="kw">def</span> <span class="fu">apply</span>(consumerSettings: ConsumerSettings, producerSettings: ProducerSettings,
+    db: Database)(<span class="kw">implicit</span> ec: ExecutionContext): RunnableGraph[(Consumer.<span class="fu">Control</span>, Future[Done])] = 
+    Consumer.<span class="fu">committableSource</span>(consumerSettings, Subscriptions.<span class="fu">topics</span>(<span class="st">&quot;input&quot;</span>))
+      <span class="co">// JSON deserialization</span>
+      .<span class="fu">mapConcat</span> { kafkaMsg =&gt;
+        Json.<span class="fu">parse</span>(kafkaMsg.<span class="fu">record</span>.<span class="fu">value</span>).<span class="fu">validate</span>[Message] <span class="kw">match</span> {
+          <span class="kw">case</span> <span class="fu">JsSuccess</span>(v, _) =&gt; List((kafkaMsg, v))
+          <span class="kw">case</span> e: JsError      =&gt; Nil
+        }
+      }
+      <span class="co">// Message validation</span>
+      .<span class="fu">mapConcat</span> { <span class="kw">case</span> (kafkaMsg, msg) =&gt; 
+        Result.<span class="fu">fromMessage</span>(msg) <span class="kw">match</span> {
+          <span class="kw">case</span> <span class="fu">Right</span>(result) =&gt; List((kafkaMsg, result))
+          <span class="kw">case</span> <span class="fu">Left</span>(err)     =&gt; Nil
+        }
+      }
+      <span class="co">// Database write</span>
+      .<span class="fu">mapAsync</span>(<span class="dv">1</span>) {
+        <span class="kw">case</span> (kafkaMsg, result) =&gt; 
+          db.<span class="fu">write</span>(result).<span class="fu">map</span>(_ =&gt; (kafkaMsg, result))
+      }
+      <span class="co">// ProducerMessage creation</span>
+      .<span class="fu">map</span> {
+        <span class="kw">case</span> (kafkaMsg, result) =&gt; <span class="fu">toProducerMessage</span>(kafkaMsg, result, <span class="st">&quot;output&quot;</span>)
+      }
+      <span class="co">// Topic output</span>
+      .<span class="fu">via</span>(Producer.<span class="fu">flow</span>(producerSettings))
+      <span class="co">// Message commit</span>
+      .<span class="fu">mapAsync</span>(<span class="dv">1</span>)(_.<span class="fu">message</span>.<span class="fu">passThrough</span>.<span class="fu">committableOffset</span>.<span class="fu">commitScaladsl</span>())
+      .<span class="fu">toMat</span>(Sink.<span class="fu">ignore</span>)(Keep.<span class="fu">both</span>)
+}</code></pre></div>
+<p>There are 2 problems that I’d like to point out with this formulation:</p>
+<ul>
+<li><p>We drop the message from the stream whenever there’s an error (in the <code>mapConcat</code> stages). This might look fine at first, but the real problem here is that we won’t commit the offset, and thus re-read the message if we happen to restart.</p>
+<p>We choose to drop the message here since we can’t feed the <code>Producer.flow</code> stage with an <code>Either</code> (or any other effectful type); we have to give it an actual <code>ProducerMessage</code>. In other words, there’s no “optional produce”.</p></li>
+<li><p>We have to “carry around” the <code>CommittableMessage</code>, even though we’re only working with the <code>Message</code> or the <code>Result</code>.</p>
+<p>This also means that it’s hard to separate the business logic from the Kafka logic; all stages deal both with domain data types (<code>Message</code>, <code>Result</code>) and with Kafka data types. The difficulty will show up when testing the stages, as we would have to mock the Kafka data types (or run integration tests).</p></li>
+</ul>
+<p>So how do we solve these 2 problems? Let’s tackle them separately.</p>
+<h1 id="creating-an-optional-producer">Creating an optional producer</h1>
+<p>Before we begin, I must say that we are going to re-implement some functionality from <code>reactive-kafka</code>. As far as I understand, there is no way to do what we want with the current interface provided by the library.</p>
+<p>Let’s assume, for simplicity, that our validation procedure returns an <code>Option</code> instead of an <code>Either</code>:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">def</span> <span class="fu">fromMessage</span>(msg: Message): Option[Result]</code></pre></div>
+<p>To write a message to a Kafka topic, we use the <code>ProducerMessage</code> data type. This type contains the destination topic, partition, the data itself and some more metadata and a passthrough <code>P</code>: a data type that’ll be attached to the producer’s result.</p>
+<p>Since <code>Option</code> has a <code>Functor</code> instance, we can use <code>map</code> to convert the <code>Result</code> using <code>toProducerMessage</code>:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">val</span> kafkaMsg: CommittableMessage
+<span class="kw">val</span> maybeResult: Option[Result]
+<span class="kw">val</span> maybeProducerMessage: Option[ProducerMessage[Result]] = maybeResult.<span class="fu">map</span>(<span class="fu">toProducerMessage</span>(kafkaMsg, _))</code></pre></div>
+<p>Great! Now, how do we actually write this to a topic? Let’s assume we have a plain old Future-based function for writing:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">def</span> produce[P](producerMsg: ProducerMessage[P]): Future[ProducerResult[P]]</code></pre></div>
+<p>How can we use produce on the <code>Option</code>? Let’s pattern match and work our way through the cases:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">val</span> result: Future[ProducerResult[P]] = maybeProducerMessage <span class="kw">match</span> {
+  <span class="co">// This is the easy case - run the function:</span>
+  <span class="kw">case</span> Some(pm) =&gt; <span class="fu">produce</span>(pm)
+  <span class="kw">case</span> None     =&gt; <span class="co">// What now?</span>
+}</code></pre></div>
+<p>If our desired return type is <code>Future[ProducerResult[P]]</code>, we’re in trouble for the <code>None</code> case, as there is no <code>ProducerMessage</code> to write.</p>
+<p>We can return a <code>Future.failed(new NoSuchElementException)</code>, but if we’re going to use this function with <code>mapAsync</code> from Akka Streams, that means going through stream supervision or using the <code>.recover</code> combinator to catch the specific exception and replace it with a placeholder element.</p>
+<p>Possible, but dirty.</p>
+<p>Instead, let’s adjust our return type to be <code>Future[Option[ProducerResult[P]]]</code>. This makes more sense, as an optional <code>ProducerMessage</code> means we should get an optional <code>ProducerResult</code>. Here’s the adjusted expression:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">val</span> result: Future[Option[ProducerResult[P]]] = maybeProducerMessage <span class="kw">match</span> {
+  <span class="kw">case</span> Some(pm) =&gt; <span class="fu">produce</span>(pm).<span class="fu">map</span>(Some(_))
+  <span class="kw">case</span> None     =&gt; Future.<span class="fu">successful</span>(None)
+}</code></pre></div>
+<p>Looks much better. <code>mapAsync</code> will unwrap the <code>Future</code> when running this in the stream, so we can continue working with the <code>Option</code> throughout the stream.</p>
+<p>This operation is called <code>traverse</code>. We’re taking an <code>Option[ProducerMessage]</code>, running a function <code>ProducerMessage =&gt; Future[ProducerResult]</code> inside it, and then turning it into a <code>Future[Option[ProducerMessage]]</code>.</p>
+<p>More abstractly, this works for all <code>F[_], G[_], A, B</code>, where <code>G[_]</code> is an <code>Applicative Functor</code> and <code>F[_]</code> is a <code>Traversable Functor</code>; <code>traverse</code> is then of the form:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">def</span> traverse[F[_], G[_], A, B](fa: F[A])(f: A =&gt; G[B]): G[F[B]]</code></pre></div>
+<p>These typeclasses are included in cats, so we’ll import the required implicits and use the syntax enrichments:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">import</span> cats.<span class="fu">implicits</span>._
+
+<span class="co">// Important to have an EC in scope, otherwise the Applicative instance </span>
+<span class="co">// for Future can't be derived</span>
+<span class="kw">implicit</span> <span class="kw">val</span> ec: ExecutionContext = ???
+
+<span class="kw">val</span> result: Future[Option[ProducerResult[P]]] = maybeProducerMessage.<span class="fu">traverse</span>(produce)</code></pre></div>
+<p>The added benefit is that we can now work with any effect that has a <code>Traverse</code> instance. This includes <code>Either[E, ?]</code>, <code>Try</code>, <code>List</code> and even <a href="https://github.com/iravid/play-json-cats"><code>play-json</code>’s <code>JsResult</code></a>.</p>
+<p>We can capture this generic produce in another method:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">import</span> cats.<span class="fu">Traverse</span>
+
+<span class="kw">def</span> produceF[F[_]: Traverse, P](fpm: F[ProducerMessage[P]])(
+  <span class="kw">implicit</span> ec: ExecutionContext): Future[F[ProducerResult[P]]] = 
+  fpm.<span class="fu">traverse</span>(produce)</code></pre></div>
+<p>And now, we can use it in our stream without dropping bad messages:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala">Consumer.<span class="fu">committableSource</span>(consumerSettings, Subscriptions.<span class="fu">topics</span>(<span class="st">&quot;input&quot;</span>))
+  <span class="co">// JSON deserialization</span>
+  .<span class="fu">map</span> { kafkaMsg =&gt;
+    (kafkaMsg, Json.<span class="fu">parse</span>(kafkaMsg.<span class="fu">record</span>.<span class="fu">value</span>).<span class="fu">validate</span>[Message].<span class="fu">asEither</span>)
+  }
+  <span class="co">// Message validation - changed to keep the Either</span>
+  .<span class="fu">map</span> { <span class="kw">case</span> (kafkaMsg, maybeMsg) =&gt; 
+    (kafkaMsg, maybeMsg.<span class="fu">flatMap</span>(Result.<span class="fu">fromMessage</span>))  
+  }
+  <span class="co">// Database write - changed to use traverse</span>
+  .<span class="fu">mapAsync</span>(<span class="dv">1</span>) {
+    <span class="kw">case</span> (kafkaMsg, maybeResult) =&gt; 
+      maybeResult
+        .<span class="fu">traverse</span>(db.<span class="fu">write</span>(_))
+        .<span class="fu">map</span>(_ =&gt; (kafkaMsg, result))
+  }
+  <span class="co">// ProducerMessage creation</span>
+  .<span class="fu">map</span> {
+    <span class="kw">case</span> (kafkaMsg, result) =&gt; 
+      result.<span class="fu">map</span>(<span class="fu">toProducerMessage</span>(kafkaMsg, _, <span class="st">&quot;output&quot;</span>))
+  }
+  <span class="co">// Topic output - changed to use produceF</span>
+  .<span class="fu">mapAsync</span>(<span class="dv">1</span>)(<span class="fu">produceF</span>(_))
+  <span class="co">// Message commit - changed to use traverse (looks a bit noisier,</span>
+  <span class="co">// but this is just boilerplate added by the closures)</span>
+  .<span class="fu">mapAsync</span>(<span class="dv">1</span>) { maybeProducerResult =&gt;
+    maybeProducerResult.<span class="fu">traverse</span> { producerResult =&gt;
+      producerResult.<span class="fu">message</span>.<span class="fu">passThrough</span>.<span class="fu">committableOffset</span>.<span class="fu">commitScaladsl</span>()
+    }
+  }
+  .<span class="fu">toMat</span>(Sink.<span class="fu">ignore</span>)(Keep.<span class="fu">both</span>)</code></pre></div>
+<p>Note the changes in the validation, database write, topic output and commit stages.</p>
+<p>For completeness, here’s a version of <code>produceF</code>, using the raw <code>KafkaProducer</code> from the <code>kafka-clients</code> package:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">def</span> produceF[F[_]: Traverse, T](producer: KafkaProducer, topicName: TopicName,
+  message: F[ProducerMessage[T]])(<span class="kw">implicit</span> ec: ExecutionContext): Future[F[ProducerResult[T]]] =
+  message traverse { t =&gt;
+    <span class="kw">val</span> promise = Promise[ProducerResult[T]]()
+
+    producer.<span class="fu">send</span>(t.<span class="fu">record</span>,
+      <span class="kw">new</span> Callback {
+      @<span class="fu">SuppressWarnings</span>(Array(<span class="st">&quot;org.wartremover.warts.Null&quot;</span>))
+      <span class="kw">def</span> <span class="fu">onCompletion</span>(recordMetadata: RecordMetadata, exception: Exception): Unit =
+        <span class="kw">if</span> (exception != <span class="kw">null</span>)
+          promise.<span class="fu">failure</span>(exception)
+        <span class="kw">else</span>
+          promise.<span class="fu">success</span>((recordMetadata, t.<span class="fu">passThrough</span>))
+    })
+
+    promise.<span class="fu">future</span>
+  }</code></pre></div>
+<p>Here, <code>ProducerResult[T]</code> is a tuple of <code>RecordMetadata</code> and <code>T</code>.</p>
+<h1 id="carrying-around-a-context">Carrying around a context</h1>
+<p>We can now deal with the other problem - the boilerplate of carrying around the original Kafka message.</p>
+<p>To begin with, we can examine the data type we’re working with - <code>(CommittableMessage, Result)</code>. As only the second element is changing, we can <a href="https://www.youtube.com/watch?v=BHjIl81HgfE">add a type parameter</a> and see what we get:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">type</span> Message[T] = (CommittableMessage, T)</code></pre></div>
+<p>And where there are type parameters, there are (usually) functors, too:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">val</span> functor = <span class="kw">new</span> Functor[Message] {
+  <span class="kw">def</span> map[T, U](fa: Message[T])(f: T =&gt; U): Message[U] = (fa._<span class="dv">1</span>, <span class="fu">f</span>(fa._<span class="dv">2</span>))
+}</code></pre></div>
+<p>It turns out that <code>cats</code> has us covered, and helpfully provides a functor instance for <code>(T, ?)</code>:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">import</span> cats.<span class="fu">implicits</span>._
+<span class="kw">val</span> ourMsg: Message[Result] = (kafkaMsg, result)
+<span class="kw">val</span> mapped: Message[String] = ourMsg.<span class="fu">map</span>(_.<span class="fu">toString</span>)</code></pre></div>
+<p>Now, unless there’s a monoid instance for the left side of the tuple, we can’t write an applicative or monad instance. But we <strong>can</strong> get a <code>Traverse</code> instance. What does that mean?</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">val</span> ourMsg: Message[Result] = (kafkaMsg, result)
+<span class="kw">val</span> mappedFuture: Future[Message[String]] = ourMsg.<span class="fu">traverse</span>(r =&gt; Future(r.<span class="fu">toString</span>))</code></pre></div>
+<p>It means we can carry our context (remember, this is just a tuple of the Kafka message and the value) into the future. Not very exciting, but given the fact that traversable functors compose, we can rewrite our database writing stage more succinctly.</p>
+<p>We want to traverse two layers at once, given <code>Message[F[A]]</code> where <code>F[_]</code> has a <code>Traverse</code> instance as well. To make this clear to <code>scalac</code>, we need to use <code>cats.data.Nested</code>, which wraps a value of type <code>F[G[A]]</code>. For example, here’s how it works for <code>Message[Either[String, Result]]</code>:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="co">// Database write - type annotations added for clarity</span>
+.<span class="fu">mapAsync</span>(<span class="dv">1</span>) {
+  msg: Message[Either[String, Result]] =&gt; <span class="co">// Reminder - (CommittableMessage, Either[String, Result])</span>
+
+    <span class="kw">val</span> result: Future[Message[Either[String, Result]]] = 
+      <span class="fu">Nested</span>(msg).<span class="fu">traverse</span>(db.<span class="fu">write</span>(_)).<span class="fu">map</span>(_.<span class="fu">value</span>)
+
+    result
+}</code></pre></div>
+<p>The <code>traverse</code> call did the following:</p>
+<ul>
+<li>descended into the <code>Message</code> functor</li>
+<li>descended into the <code>Either</code> functor</li>
+<li>applied the <code>db.write</code> function, resulting in a <code>Message[Either[String, Future[Result]]]</code> value</li>
+<li>and finally flipped the layers such that <code>Future</code> is on top: <code>Future[Message[Either[String, Result]]]</code>.</li>
+</ul>
+<p>We had to wrap and unwrap the <code>Nested</code> data type, which is unfortunate, but at least that’s tucked away nicely inside the stage. Trying to implicitly derive a <code>Traverse[λ[ɑ =&gt; Message[F[ɑ]]]]</code> does not work.</p>
+<h1 id="summary">Summary</h1>
+<p>In retrospect, I think this is a clear example of how constructs such as functors and traversables show up in the most mundane code, and how the surrounding infrastructure from <code>cats</code> can just make tons of boilerplate disappear.</p>
+<p>To close the post, here’s how the graph looks like after the improvements:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala">Consumer.<span class="fu">committableSource</span>(consumerSettings, Subscriptions.<span class="fu">topics</span>(<span class="st">&quot;input&quot;</span>))
+  <span class="co">// JSON deserialization</span>
+  .<span class="fu">map</span> { kafkaMsg =&gt;
+    (kafkaMsg, Json.<span class="fu">parse</span>(kafkaMsg.<span class="fu">record</span>.<span class="fu">value</span>).<span class="fu">validate</span>[Message].<span class="fu">asEither</span>)
+  }
+  <span class="co">// Message validation</span>
+  .<span class="fu">map</span>(_.<span class="fu">map</span>(_.<span class="fu">flatMap</span>(Result.<span class="fu">fromMessage</span>)))
+  <span class="co">// Database write</span>
+  .<span class="fu">mapAsync</span>(<span class="dv">1</span>)(msg =&gt; <span class="fu">Nested</span>(msg).<span class="fu">traverse</span>(db.<span class="fu">write</span>(_)).<span class="fu">map</span>(_ =&gt; msg))
+  <span class="co">// ProducerMessage creation</span>
+  .<span class="fu">map</span> { <span class="kw">case</span> (kafkaMsg, result) =&gt; 
+    result.<span class="fu">map</span>(<span class="fu">toProducerMessage</span>(kafkaMsg, _, <span class="st">&quot;output&quot;</span>)
+  }
+  <span class="co">// Topic output</span>
+  .<span class="fu">mapAsync</span>(<span class="dv">1</span>)(<span class="fu">produceF</span>(_))
+  <span class="co">// Message commit</span>
+  .<span class="fu">mapAsync</span>(<span class="dv">1</span>) { maybeProducerResult =&gt;
+    maybeProducerResult.<span class="fu">traverse</span> { producerResult =&gt;
+      producerResult.<span class="fu">message</span>.<span class="fu">passThrough</span>.<span class="fu">committableOffset</span>.<span class="fu">commitScaladsl</span>()
+    }
+  }
+  .<span class="fu">toMat</span>(Sink.<span class="fu">ignore</span>)(Keep.<span class="fu">both</span>)</code></pre></div>
+<p>We still had to dismantle the <code>Message</code> at a few stages, but this can be solved using more specialized stages for producing to topics, committing, etc.</p>
+<p>Since this pattern of Akka Streams graphs with reactive-kafka is very common in the services we write, we ended up packaging this in a wrapper library, along with a typeclass mechanism for deserializing and serializing messages, some more useful combinators and syntax enrichments to Akka Streams. These make the above graph more declarative and clear.</p>
+<p>This library is not published currently; ping me on Twitter (<span class="citation">@itrvd</span>) if there’s interest and we’ll try and open-source it.</p>
+<p>Thanks for reading!</p>
+
+        </div>
+        <div id="footer">
+            Site proudly generated by
+            <a href="http://jaspervdj.be/hakyll">Hakyll</a>
+        </div>
+    </body>
+</html>
