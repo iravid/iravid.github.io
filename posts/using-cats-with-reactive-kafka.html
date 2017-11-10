@@ -2,31 +2,59 @@
 <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
 <html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en">
     <head>
-        <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
-        <title>Itamar's Blog - Using cats with reactive-kafka</title>
-        <link rel="stylesheet" type="text/css" href="../css/default.css" />
-        <link rel="stylesheet" type="text/css" href="../css/syntax.css" />
-    </head>
-    <body>
-        <div id="header">
-            <div id="logo">
-                <a href="../">Itamar's Blog</a>
-            </div>
-            <div id="navigation">
-                <a href="../">Home</a>
-                <a href="../archive.html">Archive</a>
-            </div>
-        </div>
-
-        <div id="content">
-            <h1>Using cats with reactive-kafka</h1>
-
-            <div class="info">
-    Posted on July  7, 2017
+  <meta charset="utf-8">
+  <title>
     
-</div>
+      Using cats with reactive-kafka &ndash;
+    
+    Itamar's Blog
+  </title>
 
-<p>At <a href="https://bigpanda.io/">my current job</a>, we’re big fans of using Kafka to replicate data between services. In fact, Kafka is the single most important input mechanism for our services: we structure them using CQRS, so their internal state is determined entirely by the contents of the commands topic. To process these topics, we use Akka Streams, and specifically the wonderful <a href="https://github.com/akka/reactive-kafka"><code>reactive-kafka</code></a> library.</p>
+  <meta name="author" content="Itamar's Blog" />
+  <meta name="description" content="Functors, and stuff" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+
+  <link href="http://netdna.bootstrapcdn.com/font-awesome/4.0.3/css/font-awesome.css" rel="stylesheet" />
+  <link rel="stylesheet" href="../css/base.css" type="text/css" media="screen, projection" />
+  <link rel="stylesheet" href="../css/pygments.css" type="text/css" />
+  <link rel="stylesheet" href="../css/syntax.css" type="text/css" />
+  <link media="only screen and (max-device-width: 480px)" href="../css/mobile.css" type="text/css" rel="stylesheet" />
+  <link media="only screen and (device-width: 768px)" href="../css/mobile.css" type="text/css" rel="stylesheet" />
+  <link href="http://fonts.googleapis.com/css?family=Yanone+Kaffeesatz" rel="stylesheet" type="text/css">
+</head>
+
+    <body>
+        <section class="sidebar">
+  <section class="name">
+    <a href="../">
+      <span id="fname">Itamar's</span>
+      <span id="fname">Blog.</span>
+    </a>
+  </section>
+
+  <section class="meta">
+    <a href="https://github.com/iravid" target="_blank" title="Follow me on GitHub" aria-label="Follow me on GitHub"><i class="fa fa-github"></i></a>
+    <a href="https://twitter.com/itrvd" target="_blank" title="Follow me on Twitter" aria-label="Follow me on Twitter"><i class="fa fa-twitter"></i></a>
+  </section>
+
+  <section class="sections">
+    <ul>
+      <li><a href="../index.html">posts</a></li>
+    </ul>
+  </section>
+</section>
+
+
+        <section class="content">
+  <h1>
+    <a href="../posts/using-cats-with-reactive-kafka.html">Using cats with reactive-kafka</a>
+  </h1>
+
+  <section class="byline">
+    July  7, 2017
+  </section>
+
+  <p>At <a href="https://bigpanda.io/">my current job</a>, we’re big fans of using Kafka to replicate data between services. In fact, Kafka is the single most important input mechanism for our services: we structure them using CQRS, so their internal state is determined entirely by the contents of the commands topic. To process these topics, we use Akka Streams, and specifically the wonderful <a href="https://github.com/akka/reactive-kafka"><code>reactive-kafka</code></a> library.</p>
 <p>Having written several services in this form, we realized that although Akka Streams and Reactive Kafka are very capable and expressive, we were still duplicating copious amounts of code: batch committing, structuring graphs for at-least-once processing, etc. Apart from that, we had some issues around conditionally producing to topics - I’ll touch that in a moment.</p>
 <p>To get this post going, I’d like to start with a motivating example showing how we use <code>reactive-kafka</code>.</p>
 <h1 id="a-motivating-example">A motivating example</h1>
@@ -279,11 +307,7 @@
 <p>Since this pattern of Akka Streams graphs with reactive-kafka is very common in the services we write, we ended up packaging this in a wrapper library, along with a typeclass mechanism for deserializing and serializing messages, some more useful combinators and syntax enrichments to Akka Streams. These make the above graph more declarative and clear.</p>
 <p>This library is not published currently; ping me on Twitter (<span class="citation">@itrvd</span>) if there’s interest and we’ll try and open-source it.</p>
 <p>Thanks for reading!</p>
+</section>
 
-        </div>
-        <div id="footer">
-            Site proudly generated by
-            <a href="http://jaspervdj.be/hakyll">Hakyll</a>
-        </div>
     </body>
 </html>

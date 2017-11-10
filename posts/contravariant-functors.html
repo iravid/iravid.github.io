@@ -1,0 +1,207 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en">
+    <head>
+  <meta charset="utf-8">
+  <title>
+    
+      On encoders, contravariant functors and contravariant applicatives &ndash;
+    
+    Itamar's Blog
+  </title>
+
+  <meta name="author" content="Itamar's Blog" />
+  <meta name="description" content="Functors, and stuff" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+
+  <link href="http://netdna.bootstrapcdn.com/font-awesome/4.0.3/css/font-awesome.css" rel="stylesheet" />
+  <link rel="stylesheet" href="../css/base.css" type="text/css" media="screen, projection" />
+  <link rel="stylesheet" href="../css/pygments.css" type="text/css" />
+  <link rel="stylesheet" href="../css/syntax.css" type="text/css" />
+  <link media="only screen and (max-device-width: 480px)" href="../css/mobile.css" type="text/css" rel="stylesheet" />
+  <link media="only screen and (device-width: 768px)" href="../css/mobile.css" type="text/css" rel="stylesheet" />
+  <link href="http://fonts.googleapis.com/css?family=Yanone+Kaffeesatz" rel="stylesheet" type="text/css">
+</head>
+
+    <body>
+        <section class="sidebar">
+  <section class="name">
+    <a href="../">
+      <span id="fname">Itamar's</span>
+      <span id="fname">Blog.</span>
+    </a>
+  </section>
+
+  <section class="meta">
+    <a href="https://github.com/iravid" target="_blank" title="Follow me on GitHub" aria-label="Follow me on GitHub"><i class="fa fa-github"></i></a>
+    <a href="https://twitter.com/itrvd" target="_blank" title="Follow me on Twitter" aria-label="Follow me on Twitter"><i class="fa fa-twitter"></i></a>
+  </section>
+
+  <section class="sections">
+    <ul>
+      <li><a href="../index.html">posts</a></li>
+    </ul>
+  </section>
+</section>
+
+
+        <section class="content">
+  <h1>
+    <a href="../posts/contravariant-functors.html">On encoders, contravariant functors and contravariant applicatives</a>
+  </h1>
+
+  <section class="byline">
+    November 10, 2017
+  </section>
+
+  <p>Functors and applicatives are very common in the functional programming landscape. They arise naturally in various computational contexts - optionality (<code>Option</code>), possible failure (<code>Either[A, ?]</code>), effect suspension (<code>IO</code>) and so forth.</p>
+<p>All of these computational contexts are functors; the practical meaning is that given a function <code>A =&gt; B</code> (forall <code>A</code>, <code>B</code>), we can lift it to operate within the context - <code>Option[A] =&gt; Option[B]</code>. That is the essential meaning of having an instance of <code>Functor</code>: the ability to lift ordinary functions to fancy functions that operate in a special context.</p>
+<p>We’ll use these data types throughout the post:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">case</span> <span class="kw">class</span> <span class="fu">Username</span>(name: String)
+<span class="kw">case</span> <span class="kw">class</span> <span class="fu">UserId</span>(id: Int)
+<span class="kw">case</span> <span class="kw">class</span> <span class="fu">User</span>(id: UserId, name: Username)</code></pre></div>
+<p>Here’s a short example to illustrate this, using <code>cats</code> and <code>cats-effect</code>:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">import</span> cats.<span class="fu">effect</span>.<span class="fu">IO</span>
+
+<span class="kw">trait</span> DB {
+  <span class="kw">def</span> <span class="fu">retrieveInt</span>(): IO[Int]
+}
+
+<span class="kw">val</span> testDB = <span class="kw">new</span> DB {
+  <span class="kw">def</span> <span class="fu">retrieveInt</span>(): IO[Int] = <span class="fu">IO</span>(<span class="dv">0</span>)
+}</code></pre></div>
+<p>Our <code>DB</code> interface only provides an <code>IO[Int]</code> output; it has no knowledge of our <code>UserId</code> data type. Luckily, since <code>IO</code> has a <code>Functor</code> instance, we can lift the <code>UserId.apply</code> function, and compose it with <code>DB.retrieveInt</code>:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">import</span> cats.<span class="fu">implicits</span>._, cats.<span class="fu">effect</span>.<span class="fu">implicits</span>._
+<span class="co">// import cats.implicits._</span>
+<span class="co">// import cats.effect.implicits._</span>
+
+<span class="kw">import</span> cats.<span class="fu">Functor</span>
+<span class="co">// import cats.Functor</span>
+
+<span class="kw">val</span> original = <span class="fu">UserId</span>(_)
+<span class="co">// original: Int =&gt; UserId = &lt;function1&gt;</span>
+
+<span class="kw">val</span> lifted = Functor[IO].<span class="fu">lift</span>(original)
+<span class="co">// lifted: cats.effect.IO[Int] =&gt; cats.effect.IO[UserId] = &lt;function1&gt;</span>
+
+<span class="kw">val</span> retrievedUserId = <span class="fu">lifted</span>(testDB.<span class="fu">retrieveInt</span>())
+<span class="co">// retrievedUserId: cats.effect.IO[UserId] = IO$1971858114</span></code></pre></div>
+<p>The essence of being able to <code>lift</code> ordinary functions means that having a <code>Functor</code> instance allows us to utilize our ordinary functions in special contexts.</p>
+<p>Let’s turn to another data type: a JSON decoder. We’ll use <code>play-json</code> in this post. The decoder type, <code>Reads[A]</code>, is morally equivalent to a function:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">type</span> Reads[A] = String =&gt; JsResult[A]
+<span class="kw">type</span> JsResult[A] = Either[JsError, A]</code></pre></div>
+<p>A JSON decoder receives a <code>String</code> and returns a possible error value. We can write a functor for his data type:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">import</span> play.<span class="fu">api</span>.<span class="fu">libs</span>.<span class="fu">json</span>._
+
+<span class="kw">implicit</span> <span class="kw">val</span> decoderFunctor = <span class="kw">new</span> Functor[Reads] {
+  <span class="kw">def</span> map[A, B](fa: Reads[A])(f: A =&gt; B): Reads[B] = 
+    Reads {
+      fa.<span class="fu">reads</span>(_).<span class="fu">map</span>(f)
+    }
+}</code></pre></div>
+<p>You’ll notice that we just reused the fact that <code>JsResult[A]</code> has a <code>Functor</code> instance. Now, going back to our original example of <code>String</code> and <code>UserId</code>, we can parse a <code>UserId</code> given a <code>Reads[String]</code> and a <code>String =&gt; UserId</code>:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">val</span> idDecoder = Reads.<span class="fu">of</span>[Int].<span class="fu">map</span>(<span class="fu">UserId</span>(_))
+<span class="co">// idDecoder: play.api.libs.json.Reads[UserId] = play.api.libs.json.Reads$$anon$8@4193da4d</span></code></pre></div>
+<p>What happens when we need to combine two parsed values?</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">val</span> nameDecoder = Reads.<span class="fu">of</span>[String].<span class="fu">map</span>(<span class="fu">Username</span>(_))
+<span class="co">// nameDecoder: play.api.libs.json.Reads[Username] = play.api.libs.json.Reads$$anon$8@e0c03bd</span></code></pre></div>
+<p>We have a function <code>(UserId, Username) =&gt; User</code>, and two instances of <code>Reads</code>. So we need a function of the form:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">def</span> <span class="fu">lift2</span>(f: (UserId, Username) =&gt; User): (JsDecoder[UserId], JsDecoder[Username]) =&gt; JsDecoder[User]</code></pre></div>
+<p>Meaning, a function that lifts a function in two arguments, to a decoder that combines two decoders. This notion is available with the <code>Applicative</code> typeclass. <code>cats</code> doesn’t provide the <code>lift2</code> function directly, but we have <code>map2</code> at our disposal, which is similar.</p>
+<p>The <code>Applicative</code> instance for <code>Reads</code> is available in <a href="https://github.com/iravid/play-json-cats">play-json-cats</a> so we’ll elide it for brevity, but let’s see how <code>map2</code> is used:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">import</span> cats.<span class="fu">Applicative</span>
+<span class="co">// import cats.Applicative</span>
+
+<span class="kw">import</span> com.<span class="fu">iravid</span>.<span class="fu">playjsoncats</span>.<span class="fu">implicits</span>._
+<span class="co">// import com.iravid.playjsoncats.implicits._</span>
+
+<span class="kw">val</span> userDecoder = Applicative[Reads].<span class="fu">map2</span>(idDecoder, nameDecoder)(<span class="fu">User</span>(_, _))
+<span class="co">// userDecoder: play.api.libs.json.Reads[User] = play.api.libs.json.Reads$$anon$8@21bf1b1f</span></code></pre></div>
+<p>Let’s now consider the dual of <code>Reads</code>: <code>Writes</code>. This, too, is just a glorified function, of the form <code>A =&gt; String</code>. Very similar to <code>Reads</code>, only this time the arrow is reversed and the possibility for failure is elided. The arrow being reversed is significant: it means that we can’t compose the encoder with functions of <code>A =&gt; B</code> as the encoder must be <strong>supplied</strong> with an <code>A</code>. Thus, we can’t have a regular <code>Functor</code> for this.</p>
+<p>But if we have a function that <strong>produces</strong> an <code>A</code>, we can pre-compose it with the encoder. Let’s try to develop an intuition for what we can do with this through an example with a simplified <code>Writes</code> definition:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">type</span> PseudoWrites[A] = A =&gt; String
+
+<span class="kw">val</span> stringWrites: PseudoWrites[Int] = _.<span class="fu">toString</span>
+
+<span class="kw">val</span> userIdToString: UserId =&gt; Int = _.<span class="fu">id</span></code></pre></div>
+<p>Here, we have a <code>Writes[Int] = Int =&gt; String</code>, and a function <code>UserId =&gt; Int</code>. Composing these functions together, we get <code>UserId =&gt; String</code> - which is a <code>Writes[UserId]</code>! So if we know how to encode a simple type <code>A</code> as a String, and we know how to encode a complex type <code>B</code> as an <code>A</code>, we can encode <code>B</code> as <code>String</code> for free.</p>
+<p>This notion is encoded in the contravariant functor typeclass:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">trait</span> Contravariant[F[_]] {
+  <span class="kw">def</span> contramap[A, B](fa: F[A])(f: B =&gt; A): F[B]
+}
+
+<span class="co">// specialized for Reads:</span>
+<span class="kw">def</span> contramap[A, B](fa: Reads[A])(f: B =&gt; A): Reads[B]</code></pre></div>
+<p>If we flip the argument order and curry the arguments, we can get something similar to <code>lift</code>:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">def</span> contralift[A, B](f: B =&gt; A): Writes[A] =&gt; Writes[B]</code></pre></div>
+<p>Notice how <code>contralift</code> flips the arrows in the lifted function; this is the notion of contravariance in a functor. As a side note, the “regular” functor is actually called a covariant functor.</p>
+<p>How is this useful, you ask? Well, libraries such as <code>play-json</code> usually come preloaded with encoders and decoders for the primitive types. Using the contravariant functor, we can succinctly derive an encoder for a wrapper type (again using <a href="https://github.com/iravid/play-json-cats/">play-json-cats</a>):</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">val</span> intWrites = Writes.<span class="fu">of</span>[Int]
+<span class="kw">val</span> userIdWrites: Writes[UserId] = intWrites.<span class="fu">contramap</span>(_.<span class="fu">id</span>)
+
+<span class="kw">val</span> stringWrites = Writes.<span class="fu">of</span>[String]
+<span class="kw">val</span> usernameWrites: Writes[Username] = stringWrites.<span class="fu">contramap</span>(_.<span class="fu">name</span>)</code></pre></div>
+<p>Continuing along, can we generalize this to more than one <code>Writes</code>, as we did with <code>Applicative</code>? Asking differently, if we know how to encode a <code>UserId</code> and a <code>Username</code>, do we know how to encode the <code>User</code> data type?</p>
+<p>Let’s see what’s the signature we’re looking for:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">def</span> <span class="fu">contramap2</span>(fa: JsEncoder[UserId], fb: JsEncoder[Username])(f: User =&gt; (UserId, Username)): JsEncoder[User]</code></pre></div>
+<p>The typeclass that describes this operation is called <code>Divide</code>, originating in Edward Kmett’s <a href="https://hackage.haskell.org/package/contravariant/">contravariant</a> package; here’s how it looks like in Scala:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">trait</span> Divide[F[_]] <span class="kw">extends</span> Contravariant[F] {
+  <span class="kw">def</span> divide[A, B, C](fb: F[A], fc: F[B])(f: C =&gt; (A, B)): F[C]
+}</code></pre></div>
+<p>The division wording comes from the fact that we are dividing a big problem (the notion of encoding a <code>User</code>) into smaller problems that are solvable (encoding a <code>UserId</code> and a <code>Username</code>).</p>
+<p>This typeclass not available in cats <a href="HTTps://github.com/typelevel/cats/issues/1935">yet</a>, but we do have <code>contramap</code> available on the cartesian builders, which acts as <code>divide</code>; we just need an instance of <code>Cartesian</code> for our <code>Writes</code>:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">import</span> cats.<span class="fu">Cartesian</span>
+<span class="co">// import cats.Cartesian</span>
+
+<span class="kw">implicit</span> <span class="kw">val</span> cartesian: Cartesian[Writes] = <span class="kw">new</span> Cartesian[Writes] {
+  <span class="kw">def</span> product[A, B](fa: Writes[A], fb: Writes[B]): Writes[(A, B)] =
+    Writes { <span class="kw">case</span> (a, b) =&gt;
+      Json.<span class="fu">arr</span>(fa.<span class="fu">writes</span>(a), fb.<span class="fu">writes</span>(b))
+    }
+}
+<span class="co">// cartesian: cats.Cartesian[play.api.libs.json.Writes] = $anon$1@430e9d37</span>
+
+<span class="kw">val</span> userWrites: Writes[User] = (userIdWrites |@| usernameWrites).<span class="fu">contramap</span>(u =&gt; (u.<span class="fu">id</span>, u.<span class="fu">name</span>))
+<span class="co">// userWrites: play.api.libs.json.Writes[User] = play.api.libs.json.Writes$$anon$6@16ca9e06</span></code></pre></div>
+<p>Do note that our choice of combining the output of the individual <code>Writes</code> instances as a <code>JsArray</code> is quite arbitrary. If we combine more than one <code>Writes</code> instances, our types line up, but we get nested arrays:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">implicit</span> <span class="kw">val</span> tripleWrites: Writes[(Int, Int, Int)] = 
+  (Writes.<span class="fu">of</span>[Int] |@| Writes.<span class="fu">of</span>[Int] |@| Writes.<span class="fu">of</span>[Int]).<span class="fu">tupled</span>
+<span class="co">// tripleWrites: play.api.libs.json.Writes[(Int, Int, Int)] = play.api.libs.json.Writes$$anon$6@4682b468</span>
+
+tripleWrites.<span class="fu">writes</span>((<span class="dv">1</span>, <span class="dv">1</span>, <span class="dv">1</span>)).<span class="fu">toString</span>
+<span class="co">// res6: String = [1,[1,1]]</span></code></pre></div>
+<p>This typeclass instance is, in fact, unlawful. Instances of the <code>Cartesian</code> typeclass are required to uphold the associativity law - <code>(a product b) product c</code> must be equal to <code>a product (b product c)</code>. In our case, the two formulations would result in encoders which produce different JSON arrays:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">implicit</span> <span class="kw">val</span> intWriter = Writes.<span class="fu">of</span>[Int]
+<span class="co">// intWriter: play.api.libs.json.Writes[Int] = play.api.libs.json.DefaultWrites$IntWrites$@7388d94d</span>
+
+<span class="kw">implicit</span> <span class="kw">val</span> sideA: Writes[(Int, Int, Int)] = 
+  (intWriter <span class="fu">product</span> (intWriter product intWriter)).<span class="fu">contramap</span> {
+    <span class="kw">case</span> (a, b, c) =&gt; (a, (b, c))
+  }
+<span class="co">// sideA: play.api.libs.json.Writes[(Int, Int, Int)] = play.api.libs.json.Writes$$anon$6@189c12c4</span>
+
+<span class="kw">implicit</span> <span class="kw">val</span> sideB: Writes[(Int, Int, Int)] = 
+  ((intWriter product intWriter) product intWriter).<span class="fu">contramap</span> {
+    <span class="kw">case</span> (a, b, c) =&gt; ((a, b), c)
+  }
+<span class="co">// sideB: play.api.libs.json.Writes[(Int, Int, Int)] = play.api.libs.json.Writes$$anon$6@6e3a479f</span>
+
+sideA.<span class="fu">writes</span>((<span class="dv">1</span>, <span class="dv">1</span>, <span class="dv">1</span>)).<span class="fu">toString</span>
+<span class="co">// res7: String = [1,[1,1]]</span>
+
+sideB.<span class="fu">writes</span>((<span class="dv">1</span>, <span class="dv">1</span>, <span class="dv">1</span>)).<span class="fu">toString</span>
+<span class="co">// res8: String = [[1,1],1]</span></code></pre></div>
+<p>A more principled way of combining encoders is required. We could introspect the resulting <code>JsValue</code> in the composed encoder and flatten the resulting JSON array, but what would happen though if we would like to preserve nesting in products? This is not an easy problem. <a href="https://twitter.com/fommil">Sam Halliday</a> has been tackling the same issues in his <a href="https://gitlab/fommil/stalactite">scalaz-deriving</a> project. We’ll follow along to see what solutions he’ll discover :-)</p>
+<p>We can summarize by saying that the laws can be successfully upheld when the target datatype for the typeclass is a lawful semigroup (e.g. <code>(a |+| b) |+| c &lt;-&gt; a |+| (b |+| c)</code>). <code>JsValue</code> under the JSON array concatenation as formulated here is not.</p>
+<p>Other useful, lawful instances often show up when dealing with type constructors that are isomorphic to functions that consume the data. For example:</p>
+<ul>
+<li><code>Equal[A]</code>, which is isomorphic to <code>(A, A) =&gt; Boolean</code>;</li>
+<li><code>Order[A]</code>, which is isomorphic to <code>(A, A) =&gt; LT/EQ/GT</code>;</li>
+<li><code>Predicate[A]</code> - which is just a fancy name for <code>A =&gt; Boolean</code>.</li>
+</ul>
+<p>Admittedly, these aren’t as common as the covariant functors, but they’re quite useful for reducing boilerplate.</p>
+<p>When starting out this post, I had hoped that I would figure out a good way to build up encoder instances for product types out of the instances of their fields, but we have not managed to achieve that lawfully. I intend on a following post to look into the relationship between encoders (contravariant functors), decoders (covariant functors) and profunctors - functors that are contravariant on one type parameter and covariant on the other. Should be interesting!</p>
+</section>
+
+    </body>
+</html>
