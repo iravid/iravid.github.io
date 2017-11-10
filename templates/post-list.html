@@ -1,7 +1,9 @@
-<ul>
+<section class="content">
+  <ul class="listing">
     $for(posts)$
-        <li>
-            <a href="$url$">$title$</a> - $date$
-        </li>
+      <li>
+        <span>$date$</span> <a href="$url$">$title$</a>
+      </li>
     $endfor$
-</ul>
+  </ul>
+</section>
