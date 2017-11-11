@@ -18,4 +18,8 @@ executable github-blog
   default-language:    Haskell2010
   ghc-options:         -threaded
   build-depends:       base >= 4.7 && < 5,
-                       hakyll
+                       hakyll,
+                       typed-process,
+                       mtl,
+                       filepath,
+                       bytestring
