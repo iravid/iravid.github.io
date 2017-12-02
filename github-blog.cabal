@@ -22,4 +22,7 @@ executable github-blog
                        typed-process,
                        mtl,
                        filepath,
-                       bytestring
+                       bytestring,
+                       pandoc-types,
+                       pandoc,
+                       directory

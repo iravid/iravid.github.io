@@ -1,14 +1,13 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE NoMonomorphismRestriction #-}
-import           Control.Monad              (forM_)
-import           Control.Monad.Reader       (ask)
 import           Data.Monoid                ((<>))
 import           Hakyll
 import           Hakyll.Core.Identifier (toFilePath)
-import           Hakyll.Core.Rules.Internal (Rules (..), rulesMatches)
-import           System.Process.Typed       (proc, runProcess_)
+import           Hakyll.Core.Provider.Metadata (parsePage)
 import           System.FilePath
-
+import           System.Directory
+import           Text.Pandoc.Definition
+import           Text.Pandoc (readMarkdown)
 
 --------------------------------------------------------------------------------
 main :: IO ()
@@ -22,20 +21,28 @@ main = hakyll $ do
         compile compressCssCompiler
 
     match "posts/*.org" $ do
-      preprocess tutblog
+      compile $ do
+        fileBody <- getResourceString
+        typechecked <- withItemBody transformWithTut fileBody
+        unsafeCompiler $ do
+          let body = itemBody typechecked
+          createDirectoryIfMissing True "output"
+          writeFile ("output" </> (takeBaseName $ toFilePath $ itemIdentifier typechecked) <> ".md") body
+        return fileBody
 
-    match "posts/output/*.md" $ do
-        route $ (setExtension "html") `composeRoutes` (customRoute $ ("posts" </>) . takeFileName . toFilePath) 
+    orgFiles <- makePatternDependency "posts/*.org"
+    match "output/*.md" $ rulesExtraDependencies [orgFiles] $ do
+        route $ setExtension "html" `composeRoutes` gsubRoute "output" (const "posts")
         compile $ do
-          pandocCompiler
-            >>= loadAndApplyTemplate "templates/post.html"    postCtx
-            >>= loadAndApplyTemplate "templates/default.html" postCtx
-            >>= relativizeUrls
+          rendered <- pandocCompiler
+          postTemplate <- loadAndApplyTemplate "templates/post.html" postCtx rendered
+          defaultTemplate <- loadAndApplyTemplate "templates/default.html" postCtx postTemplate
+          relativizeUrls defaultTemplate
 
     match "index.html" $ do
         route idRoute
         compile $ do
-            posts <- recentFirst =<< loadAll "posts/output/*.md"
+            posts <- recentFirst =<< loadAll "output/*.md"
             let indexCtx =
                     listField "posts" postCtx (return posts) <>
                     constField "title" "Home"                <>
@@ -65,15 +72,9 @@ siteCtx =
 
 ----------------------------
 
-tutblog :: IO ()
-tutblog = do
-  let tutblogArgs = [ "--org-dir", "./posts"
-                    , "--tut-dir", "./posts/tut"
-                    , "--md-dir",  "./posts/output"
-                    , "--coursier-launcher",  "/Users/iravid/Development/personal/tutblog/coursier"
-                    , "--coursier-deps", "org.typelevel::cats:0.9.0,org.typelevel::cats-effect:0.3,com.typesafe.play::play-json:2.5.10,com.iravid::play-json-cats:0.2" ]
-  runProcess_ $ proc "tutblog" tutblogArgs
-  return ()
+transformWithTut :: String -> Compiler String
+transformWithTut contents =
+  unixFilter "tutblog" ["--coursier-launcher", "/usr/local/bin/coursier"] contents
 
 orgPathToMdPath :: FilePath -> FilePath
 orgPathToMdPath orgPath = "posts" </> "output" </> baseName <> ".md"
