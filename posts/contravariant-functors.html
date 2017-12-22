@@ -14,13 +14,13 @@
   <meta name="description" content="Functors, and stuff" />
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
 
-  <link href="http://netdna.bootstrapcdn.com/font-awesome/4.0.3/css/font-awesome.css" rel="stylesheet" />
+  <link href="https://netdna.bootstrapcdn.com/font-awesome/4.0.3/css/font-awesome.css" rel="stylesheet" />
   <link rel="stylesheet" href="../css/base.css" type="text/css" media="screen, projection" />
   <link rel="stylesheet" href="../css/pygments.css" type="text/css" />
   <link rel="stylesheet" href="../css/syntax.css" type="text/css" />
   <link media="only screen and (max-device-width: 480px)" href="../css/mobile.css" type="text/css" rel="stylesheet" />
   <link media="only screen and (device-width: 768px)" href="../css/mobile.css" type="text/css" rel="stylesheet" />
-  <link href="http://fonts.googleapis.com/css?family=Yanone+Kaffeesatz" rel="stylesheet" type="text/css">
+  <link href="https://fonts.googleapis.com/css?family=Yanone+Kaffeesatz" rel="stylesheet" type="text/css">
 </head>
 
     <body>
@@ -85,7 +85,7 @@
 <span class="co">// lifted: cats.effect.IO[Int] =&gt; cats.effect.IO[UserId] = &lt;function1&gt;</span>
 
 <span class="kw">val</span> retrievedUserId = <span class="fu">lifted</span>(testDB.<span class="fu">retrieveInt</span>())
-<span class="co">// retrievedUserId: cats.effect.IO[UserId] = IO$1971858114</span></code></pre></div>
+<span class="co">// retrievedUserId: cats.effect.IO[UserId] = IO$1562772628</span></code></pre></div>
 <p>The essence of being able to <code>lift</code> ordinary functions means that having a <code>Functor</code> instance allows us to utilize our ordinary functions in special contexts.</p>
 <p>Let’s turn to another data type: a JSON decoder. We’ll use <code>play-json</code> in this post. The decoder type, <code>Reads[A]</code>, is morally equivalent to a function:</p>
 <div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">type</span> Reads[A] = String =&gt; JsResult[A]
@@ -101,10 +101,10 @@
 }</code></pre></div>
 <p>You’ll notice that we just reused the fact that <code>JsResult[A]</code> has a <code>Functor</code> instance. Now, going back to our original example of <code>String</code> and <code>UserId</code>, we can parse a <code>UserId</code> given a <code>Reads[String]</code> and a <code>String =&gt; UserId</code>:</p>
 <div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">val</span> idDecoder = Reads.<span class="fu">of</span>[Int].<span class="fu">map</span>(<span class="fu">UserId</span>(_))
-<span class="co">// idDecoder: play.api.libs.json.Reads[UserId] = play.api.libs.json.Reads$$anon$8@4193da4d</span></code></pre></div>
+<span class="co">// idDecoder: play.api.libs.json.Reads[UserId] = play.api.libs.json.Reads$$anon$8@3f7a7ce6</span></code></pre></div>
 <p>What happens when we need to combine two parsed values?</p>
 <div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">val</span> nameDecoder = Reads.<span class="fu">of</span>[String].<span class="fu">map</span>(<span class="fu">Username</span>(_))
-<span class="co">// nameDecoder: play.api.libs.json.Reads[Username] = play.api.libs.json.Reads$$anon$8@e0c03bd</span></code></pre></div>
+<span class="co">// nameDecoder: play.api.libs.json.Reads[Username] = play.api.libs.json.Reads$$anon$8@7c4de811</span></code></pre></div>
 <p>We have a function <code>(UserId, Username) =&gt; User</code>, and two instances of <code>Reads</code>. So we need a function of the form:</p>
 <div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">def</span> <span class="fu">lift2</span>(f: (UserId, Username) =&gt; User): (JsDecoder[UserId], JsDecoder[Username]) =&gt; JsDecoder[User]</code></pre></div>
 <p>Meaning, a function that lifts a function in two arguments, to a decoder that combines two decoders. This notion is available with the <code>Applicative</code> typeclass. <code>cats</code> doesn’t provide the <code>lift2</code> function directly, but we have <code>map2</code> at our disposal, which is similar.</p>
@@ -116,7 +116,7 @@
 <span class="co">// import com.iravid.playjsoncats.implicits._</span>
 
 <span class="kw">val</span> userDecoder = Applicative[Reads].<span class="fu">map2</span>(idDecoder, nameDecoder)(<span class="fu">User</span>(_, _))
-<span class="co">// userDecoder: play.api.libs.json.Reads[User] = play.api.libs.json.Reads$$anon$8@21bf1b1f</span></code></pre></div>
+<span class="co">// userDecoder: play.api.libs.json.Reads[User] = play.api.libs.json.Reads$$anon$8@2e9bff08</span></code></pre></div>
 <p>Let’s now consider the dual of <code>Reads</code>: <code>Writes</code>. This, too, is just a glorified function, of the form <code>A =&gt; String</code>. Very similar to <code>Reads</code>, only this time the arrow is reversed and the possibility for failure is elided. The arrow being reversed is significant: it means that we can’t compose the encoder with functions of <code>A =&gt; B</code> as the encoder must be <strong>supplied</strong> with an <code>A</code>. Thus, we can’t have a regular <code>Functor</code> for this.</p>
 <p>But if we have a function that <strong>produces</strong> an <code>A</code>, we can pre-compose it with the encoder. Let’s try to develop an intuition for what we can do with this through an example with a simplified <code>Writes</code> definition:</p>
 <div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">type</span> PseudoWrites[A] = A =&gt; String
@@ -159,32 +159,32 @@
       Json.<span class="fu">arr</span>(fa.<span class="fu">writes</span>(a), fb.<span class="fu">writes</span>(b))
     }
 }
-<span class="co">// cartesian: cats.Cartesian[play.api.libs.json.Writes] = $anon$1@430e9d37</span>
+<span class="co">// cartesian: cats.Cartesian[play.api.libs.json.Writes] = $anon$1@2b4b3918</span>
 
 <span class="kw">val</span> userWrites: Writes[User] = (userIdWrites |@| usernameWrites).<span class="fu">contramap</span>(u =&gt; (u.<span class="fu">id</span>, u.<span class="fu">name</span>))
-<span class="co">// userWrites: play.api.libs.json.Writes[User] = play.api.libs.json.Writes$$anon$6@16ca9e06</span></code></pre></div>
+<span class="co">// userWrites: play.api.libs.json.Writes[User] = play.api.libs.json.Writes$$anon$6@25c8d646</span></code></pre></div>
 <p>Do note that our choice of combining the output of the individual <code>Writes</code> instances as a <code>JsArray</code> is quite arbitrary. If we combine more than one <code>Writes</code> instances, our types line up, but we get nested arrays:</p>
 <div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">implicit</span> <span class="kw">val</span> tripleWrites: Writes[(Int, Int, Int)] = 
   (Writes.<span class="fu">of</span>[Int] |@| Writes.<span class="fu">of</span>[Int] |@| Writes.<span class="fu">of</span>[Int]).<span class="fu">tupled</span>
-<span class="co">// tripleWrites: play.api.libs.json.Writes[(Int, Int, Int)] = play.api.libs.json.Writes$$anon$6@4682b468</span>
+<span class="co">// tripleWrites: play.api.libs.json.Writes[(Int, Int, Int)] = play.api.libs.json.Writes$$anon$6@5138d63a</span>
 
 tripleWrites.<span class="fu">writes</span>((<span class="dv">1</span>, <span class="dv">1</span>, <span class="dv">1</span>)).<span class="fu">toString</span>
 <span class="co">// res6: String = [1,[1,1]]</span></code></pre></div>
 <p>This typeclass instance is, in fact, unlawful. Instances of the <code>Cartesian</code> typeclass are required to uphold the associativity law - <code>(a product b) product c</code> must be equal to <code>a product (b product c)</code>. In our case, the two formulations would result in encoders which produce different JSON arrays:</p>
 <div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">implicit</span> <span class="kw">val</span> intWriter = Writes.<span class="fu">of</span>[Int]
-<span class="co">// intWriter: play.api.libs.json.Writes[Int] = play.api.libs.json.DefaultWrites$IntWrites$@7388d94d</span>
+<span class="co">// intWriter: play.api.libs.json.Writes[Int] = play.api.libs.json.DefaultWrites$IntWrites$@221ef0f0</span>
 
 <span class="kw">implicit</span> <span class="kw">val</span> sideA: Writes[(Int, Int, Int)] = 
   (intWriter <span class="fu">product</span> (intWriter product intWriter)).<span class="fu">contramap</span> {
     <span class="kw">case</span> (a, b, c) =&gt; (a, (b, c))
   }
-<span class="co">// sideA: play.api.libs.json.Writes[(Int, Int, Int)] = play.api.libs.json.Writes$$anon$6@189c12c4</span>
+<span class="co">// sideA: play.api.libs.json.Writes[(Int, Int, Int)] = play.api.libs.json.Writes$$anon$6@3495cc8d</span>
 
 <span class="kw">implicit</span> <span class="kw">val</span> sideB: Writes[(Int, Int, Int)] = 
   ((intWriter product intWriter) product intWriter).<span class="fu">contramap</span> {
     <span class="kw">case</span> (a, b, c) =&gt; ((a, b), c)
   }
-<span class="co">// sideB: play.api.libs.json.Writes[(Int, Int, Int)] = play.api.libs.json.Writes$$anon$6@6e3a479f</span>
+<span class="co">// sideB: play.api.libs.json.Writes[(Int, Int, Int)] = play.api.libs.json.Writes$$anon$6@5ca5dea1</span>
 
 sideA.<span class="fu">writes</span>((<span class="dv">1</span>, <span class="dv">1</span>, <span class="dv">1</span>)).<span class="fu">toString</span>
 <span class="co">// res7: String = [1,[1,1]]</span>

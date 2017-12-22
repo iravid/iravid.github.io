@@ -1,0 +1,474 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en">
+    <head>
+  <meta charset="utf-8">
+  <title>
+    
+      Functional programming and Spark: do they mix? &ndash;
+    
+    Itamar's Blog
+  </title>
+
+  <meta name="author" content="Itamar's Blog" />
+  <meta name="description" content="Functors, and stuff" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+
+  <link href="https://netdna.bootstrapcdn.com/font-awesome/4.0.3/css/font-awesome.css" rel="stylesheet" />
+  <link rel="stylesheet" href="../css/base.css" type="text/css" media="screen, projection" />
+  <link rel="stylesheet" href="../css/pygments.css" type="text/css" />
+  <link rel="stylesheet" href="../css/syntax.css" type="text/css" />
+  <link media="only screen and (max-device-width: 480px)" href="../css/mobile.css" type="text/css" rel="stylesheet" />
+  <link media="only screen and (device-width: 768px)" href="../css/mobile.css" type="text/css" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css?family=Yanone+Kaffeesatz" rel="stylesheet" type="text/css">
+</head>
+
+    <body>
+        <section class="sidebar">
+  <section class="name">
+    <a href="../">
+      <span id="fname">Itamar's</span>
+      <span id="fname">Blog.</span>
+    </a>
+  </section>
+
+  <section class="meta">
+    <a href="https://github.com/iravid" target="_blank" title="Follow me on GitHub" aria-label="Follow me on GitHub"><i class="fa fa-github"></i></a>
+    <a href="https://twitter.com/itrvd" target="_blank" title="Follow me on Twitter" aria-label="Follow me on Twitter"><i class="fa fa-twitter"></i></a>
+  </section>
+
+  <section class="sections">
+    <ul>
+      <li><a href="../index.html">posts</a></li>
+    </ul>
+  </section>
+</section>
+
+
+        <section class="content">
+  <h1>
+    <a href="../posts/fp-and-spark.html">Functional programming and Spark: do they mix?</a>
+  </h1>
+
+  <section class="byline">
+    December 22, 2017
+  </section>
+
+  <p>So, Spark. A very popular option for large-scale distributed data processing on the JVM, doubly so when working with Scala. Spark has many advantages (rich ML library, great infrastructure for SQL-like data transformations), but also many problems: its entire API is side effecting; throwing exceptions is liberally used as an error reporting mechanism and type safety is practically non-existent in the DataFrame API.</p>
+<p>Can we do anything to alleviate those pains? It’s certainly worth trying as there are currently no obviously better alternatives for doing in-memory data processing or machine learning on the JVM. We should discuss what we’re aiming for, though, as there are several “levels” of safety we can gain:</p>
+<ol style="list-style-type: decimal">
+<li>We can make do without any sort of safety entirely. Use Spark imperatively as the documentation suggests, throw and catch exceptions and live with it. I’ll show one concrete issue with that in a moment.</li>
+<li>We can use a functional programming library, such as <a href="https://github.com/typelevel/cats">cats</a> or <a href="https://github.com/scalaz/scalaz">scalaz</a>, and an IO monad, such as <a href="https://monix.io/">Monix Task</a> or <a href="https://github.com/scalaz/scalaz/pull/1519">the upcoming IO in scalaz 8</a>, to adapt the Spark API as needed.</li>
+<li>We can use <a href="https://github.com/typelevel/frameless">frameless</a>, a library that wraps the Spark API wholesale and provides an entirely type-safe and functional API.</li>
+</ol>
+<p>Option 3 is of course the most desirable choice, but frameless unfortunately does not cover all of the Spark API yet. I encourage you to contribute, though; the project has an ambitious but entirely achievable goal, and if you use Spark, you can easily dogfood with it and gain the benefits of typesafety.</p>
+<p>We’ll discuss option 2 in this post. I think there is much benefit to be had by adapting the Spark API with an IO monad, as that allows you to reason about your job and its behavior and use all of the wonderful abstractions that functional programming brings.</p>
+<p>This post is typechecked with <a href="https://github.com/tpolecat/tut">tut</a>, so let’s get some of the required imports and infrastructure out of the way:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">import</span> cats._, cats.<span class="fu">data</span>._, cats.<span class="fu">implicits</span>._
+<span class="kw">import</span> monix.<span class="fu">eval</span>.{ Coeval, Task }
+<span class="kw">import</span> monix.<span class="fu">execution</span>.<span class="fu">Scheduler</span>
+<span class="kw">import</span> monix.<span class="fu">execution</span>.<span class="fu">Scheduler</span>.<span class="fu">Implicits</span>.<span class="fu">global</span>
+<span class="kw">import</span> org.<span class="fu">apache</span>.<span class="fu">spark</span>.<span class="fu">sql</span>.{ DataFrame, Dataset, SparkSession }
+<span class="kw">import</span> org.<span class="fu">apache</span>.<span class="fu">spark</span>.<span class="fu">sql</span>.{ functions =&gt; f }
+<span class="kw">import</span> scala.<span class="fu">concurrent</span>.{ Await, Future }
+<span class="kw">import</span> scala.<span class="fu">concurrent</span>.<span class="fu">duration</span>._
+
+<span class="kw">implicit</span> <span class="kw">val</span> session = (SparkSession
+  .<span class="fu">builder</span>()
+  .<span class="fu">appName</span>(<span class="st">&quot;Retaining Sanity with Spark&quot;</span>)
+  .<span class="fu">master</span>(<span class="st">&quot;local&quot;</span>)
+  .<span class="fu">getOrCreate</span>())
+
+<span class="kw">import</span> session.<span class="fu">implicits</span>._</code></pre></div>
+<h1 id="a-motivating-example">A motivating example</h1>
+<p>Spark is pretty straightforward to use, if you just want to churn out a job that runs a couple of data transformations. Here’s a sample that computes the average of a DataFrame of numbers:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">import</span> scala.<span class="fu">util</span>.<span class="fu">Random</span>
+<span class="co">// import scala.util.Random</span>
+
+<span class="kw">val</span> df = session.<span class="fu">sparkContext</span>.<span class="fu">parallelize</span>(List.<span class="fu">fill</span>(<span class="dv">100</span>)(Random.<span class="fu">nextLong</span>)).<span class="fu">toDF</span>
+<span class="co">// df: org.apache.spark.sql.DataFrame = [value: bigint]</span>
+
+df.<span class="fu">agg</span>(f.<span class="fu">avg</span>(<span class="st">&quot;value&quot;</span>)).<span class="fu">head</span>()
+<span class="co">// res2: org.apache.spark.sql.Row = [1.67238309492573504E17]</span></code></pre></div>
+<p>What happens when we’d like to run two of these operations in parallel? Spark will block when we call <code>head()</code>, so we’ll need to run this in <code>Future</code>:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">def</span> <span class="fu">computeAvg</span>(df: DataFrame) = Future(df.<span class="fu">agg</span>(f.<span class="fu">avg</span>(<span class="st">&quot;value&quot;</span>)).<span class="fu">head</span>())
+<span class="co">// computeAvg: (df: org.apache.spark.sql.DataFrame)scala.concurrent.Future[org.apache.spark.sql.Row]</span>
+
+<span class="kw">val</span> df2 = session.<span class="fu">sparkContext</span>.<span class="fu">parallelize</span>(List.<span class="fu">fill</span>(<span class="dv">100</span>)(Random.<span class="fu">nextLong</span>)).<span class="fu">toDF</span>
+<span class="co">// df2: org.apache.spark.sql.DataFrame = [value: bigint]</span>
+
+<span class="kw">val</span> result = Await.<span class="fu">result</span>(<span class="fu">computeAvg</span>(df) zip <span class="fu">computeAvg</span>(df2), <span class="fl">30.</span>seconds)
+<span class="co">// result: (org.apache.spark.sql.Row, org.apache.spark.sql.Row) = ([1.67238309492573504E17],[4.1869025993473766E17])</span></code></pre></div>
+<p>The problem with this approach, while not apparent in the example, is that Spark will actually <strong>run the two actions sequentially</strong>, as by default jobs will occupy all the cores available (assuming there are enough partitions in the underlying RDD). If we set <code>spark.scheduler.mode</code> to <code>FAIR</code>, we can use thread-locals to run the actions on different scheduler pools:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala">session.<span class="fu">stop</span>()
+
+<span class="kw">implicit</span> <span class="kw">val</span> session = (SparkSession
+  .<span class="fu">builder</span>()
+  .<span class="fu">appName</span>(<span class="st">&quot;Retaining Sanity with Spark&quot;</span>)
+  .<span class="fu">master</span>(<span class="st">&quot;local&quot;</span>)
+  .<span class="fu">config</span>(<span class="st">&quot;spark.scheduler.mode&quot;</span>, <span class="st">&quot;FAIR&quot;</span>)
+  .<span class="fu">getOrCreate</span>())
+
+<span class="kw">def</span> <span class="fu">computeAvg</span>(df: DataFrame, pool: String)(<span class="kw">implicit</span> session: SparkSession) = 
+  Future {
+    session.<span class="fu">sparkContext</span>.<span class="fu">setLocalProperty</span>(<span class="st">&quot;spark.scheduler.pool&quot;</span>, pool)
+    df.<span class="fu">agg</span>(f.<span class="fu">avg</span>(<span class="st">&quot;value&quot;</span>)).<span class="fu">head</span>()
+    session.<span class="fu">sparkContext</span>.<span class="fu">setLocalProperty</span>(<span class="st">&quot;spark.scheduler.pool&quot;</span>, <span class="kw">null</span>)
+  }</code></pre></div>
+<p>There’s more info on this <a href="http://spark.apache.org/docs/latest/job-scheduling.html#scheduling-within-an-application">here</a>. It’s interesting to note that there are now two levels of execution being controlled here: the <code>ExecutionContext</code> on which the <code>Future</code> is being executed and the scheduler pool on which the job is being executed.</p>
+<p>In any case, we can’t use this approach to sensibly build combinators for composing larger programs; writing an <code>onPool(f: Future[A], p: String): Future[A]</code> combinator that runs an existing thunk on another scheduler pool is impossible because this is done using thread-locals and the <code>f</code> thunk might be executed on an entirely different thread.</p>
+<p>Another issue is that <code>Future</code> is eager: we have to be very strict (pun not intended) about how we use the <code>computeAvg</code> method if we want to control when and where the Spark actions are executed.</p>
+<p>And lastly, we glossed over the fact that <strong>all</strong> (yes, all) of Spark’s API calls may throw exceptions at any given point, crashing our program. It is literally the antithesis of a safe API.</p>
+<h1 id="regaining-our-functional-sanity">Regaining our functional sanity</h1>
+<p>So, having motivated why we’re spending time on this, let’s discuss what we’d like to achieve. I’ll show in this post how we can:</p>
+<ul>
+<li>Use Monix to create a limited version of the <code>onPool</code> combinator and run all of our Spark computations safely and concurrently;</li>
+<li>Measure the execution time of each computation in a principled and compositional manner;</li>
+<li>Abstract over passing around the intermediate state being transformed in the application.</li>
+</ul>
+<p>Let’s get started!</p>
+<h1 id="using-monix-to-control-execution">Using Monix to control execution</h1>
+<p>We first need to get into the habit of working exclusively in <code>Task</code>. All Spark calls need to be wrapped in the <code>Task.eval / Task.apply</code> constructors. Our program now looks like this:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">def</span> buildSession: Task[SparkSession] = Task.<span class="fu">eval</span> {
+  SparkSession
+    .<span class="fu">builder</span>()
+    .<span class="fu">appName</span>(<span class="st">&quot;Retaining Sanity with Spark&quot;</span>)
+    .<span class="fu">master</span>(<span class="st">&quot;local&quot;</span>)
+    .<span class="fu">config</span>(<span class="st">&quot;spark.scheduler.mode&quot;</span>, <span class="st">&quot;FAIR&quot;</span>)
+    .<span class="fu">getOrCreate</span>() 
+}
+
+<span class="kw">def</span> <span class="fu">createDF</span>(data: List[Int])(<span class="kw">implicit</span> session: SparkSession): Task[DataFrame] = Task.<span class="fu">eval</span> {
+  <span class="kw">import</span> session.<span class="fu">implicits</span>._
+  <span class="kw">val</span> rdd = session.<span class="fu">sparkContext</span>.<span class="fu">parallelize</span>(data)
+
+  rdd.<span class="fu">toDF</span>
+}
+
+<span class="kw">def</span> <span class="fu">computeAvg</span>(df: DataFrame, pool: String)(<span class="kw">implicit</span> session: SparkSession): Task[Double] = 
+  Task.<span class="fu">eval</span> {
+    session.<span class="fu">sparkContext</span>.<span class="fu">setLocalProperty</span>(<span class="st">&quot;spark.scheduler.pool&quot;</span>, pool)
+    <span class="kw">val</span> result = df.<span class="fu">agg</span>(f.<span class="fu">avg</span>(<span class="st">&quot;value&quot;</span>)).<span class="fu">head</span>().<span class="fu">getDouble</span>(<span class="dv">0</span>)
+    session.<span class="fu">sparkContext</span>.<span class="fu">setLocalProperty</span>(<span class="st">&quot;spark.scheduler.pool&quot;</span>, <span class="kw">null</span>)
+
+    result
+  }</code></pre></div>
+<p>Doesn’t look too different so far. When we compose everything together, we get back a <code>Task</code> representing the result of our program:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">def</span> program: Task[Double] = <span class="kw">for</span> {
+  sparkSession &lt;- buildSession
+  result &lt;- {
+    <span class="kw">implicit</span> <span class="kw">val</span> session = sparkSession
+    <span class="kw">import</span> scala.<span class="fu">util</span>.<span class="fu">Random</span>
+
+    <span class="kw">val</span> data = List.<span class="fu">fill</span>(<span class="dv">100</span>)(Random.<span class="fu">nextInt</span>)
+
+    <span class="kw">for</span> {
+      df &lt;- <span class="fu">createDF</span>(data)
+      avg &lt;- <span class="fu">computeAvg</span>(df, <span class="st">&quot;pool&quot;</span>)
+    } <span class="kw">yield</span> avg
+  }
+} <span class="kw">yield</span> result</code></pre></div>
+<p>Let’s turn to creating the <code>onPool</code> combinator. Here’s a naive version that composes the actual task with two tasks that set/unset the thread-local:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">def</span> onPool[A](task: Task[A], pool: String)(<span class="kw">implicit</span> session: SparkSession): Task[A] = 
+  <span class="kw">for</span> {
+    _ &lt;- Task.<span class="fu">eval</span>(session.<span class="fu">sparkContext</span>.<span class="fu">setLocalProperty</span>(<span class="st">&quot;spark.scheduler.pool&quot;</span>, pool))
+    result &lt;- task
+    _ &lt;- Task.<span class="fu">eval</span>(session.<span class="fu">sparkContext</span>.<span class="fu">setLocalProperty</span>(<span class="st">&quot;spark.scheduler.pool&quot;</span>, <span class="kw">null</span>))
+  } <span class="kw">yield</span> result</code></pre></div>
+<p>The problem with this naive version is that if <code>task</code> has an asynchronous boundary (as the one produced by <code>Task.apply</code> for example), the <code>setLocalProperty</code> will set the thread-local on an irrelevant thread:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="co">// Works properly for Task.eval:</span>
+<span class="kw">val</span> test = Task.<span class="fu">eval</span>(<span class="fu">println</span>(session.<span class="fu">sparkContext</span>.<span class="fu">getLocalProperty</span>(<span class="st">&quot;spark.scheduler.pool&quot;</span>)))
+<span class="co">// test: monix.eval.Task[Unit] = Task.Eval(&lt;function0&gt;)</span>
+
+<span class="fu">onPool</span>(test, <span class="st">&quot;pool&quot;</span>).<span class="fu">runAsync</span>
+<span class="co">// pool</span>
+<span class="co">// res9: monix.execution.CancelableFuture[Unit] = monix.execution.CancelableFuture$Pure@5c568706</span>
+
+<span class="co">// ... but not for Task.fork:</span>
+<span class="kw">val</span> forked = Task.<span class="fu">fork</span>(test)
+<span class="co">// forked: monix.eval.Task[Unit] = Task.FlatMap(Task@803512584, &lt;function1&gt;)</span>
+
+<span class="fu">onPool</span>(forked, <span class="st">&quot;pool&quot;</span>).<span class="fu">runAsync</span>
+<span class="co">// null</span>
+<span class="co">// res11: monix.execution.CancelableFuture[Unit] = Async(Success(()),monix.execution.cancelables.StackedCancelable@2130262a)</span></code></pre></div>
+<p>A possible solution here is to use <code>monix.eval.Coeval</code>: a data type that represents synchronous evaluation. <code>Coeval</code> has a <code>Monad</code> instance, so we can create a <code>Coeval</code> that wraps our Spark API call, decorate it with setting/clearing the scheduler pool thread-local, and convert the resulting <code>Coeval</code> to a <code>Task</code>:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">def</span> onPool[A](task: Coeval[A], pool: String)(<span class="kw">implicit</span> session: SparkSession): Task[A] = 
+  (<span class="kw">for</span> {
+    _ &lt;- <span class="fu">Coeval</span>(session.<span class="fu">sparkContext</span>.<span class="fu">setLocalProperty</span>(<span class="st">&quot;spark.scheduler.pool&quot;</span>, pool))
+    result &lt;- task
+    _ &lt;- <span class="fu">Coeval</span>(session.<span class="fu">sparkContext</span>.<span class="fu">setLocalProperty</span>(<span class="st">&quot;spark.scheduler.pool&quot;</span>, <span class="kw">null</span>))
+  } <span class="kw">yield</span> result).<span class="fu">task</span></code></pre></div>
+<p>And this should now work properly:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">val</span> test = <span class="fu">Coeval</span>(<span class="fu">println</span>(session.<span class="fu">sparkContext</span>.<span class="fu">getLocalProperty</span>(<span class="st">&quot;spark.scheduler.pool&quot;</span>)))
+<span class="co">// test: monix.eval.Coeval[Unit] = &lt;function0&gt;</span>
+
+<span class="kw">val</span> forked = Task.<span class="fu">fork</span>(<span class="fu">onPool</span>(test, <span class="st">&quot;pool&quot;</span>))
+<span class="co">// forked: monix.eval.Task[Unit] = Task.FlatMap(Task@803512584, &lt;function1&gt;)</span>
+
+forked.<span class="fu">runAsync</span>
+<span class="co">// res12: monix.execution.CancelableFuture[Unit] = Async(List(),monix.execution.cancelables.StackedCancelable@732b3b00)</span>
+<span class="co">// pool</span></code></pre></div>
+<p>The last thing we need to take care of is error handling. We have to clear the scheduler pool setting if the inner task fails, or we’ll leak that setting to other tasks. This means we need to slightly modify <code>onPool</code>. Along the way, we’ll move it to an implicit class so we can get infix syntax:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">implicit</span> <span class="kw">class</span> CoevalOps[A](thunk: Coeval[A]) {
+  <span class="kw">def</span> <span class="fu">onPool</span>(pool: String)(<span class="kw">implicit</span> session: SparkSession): Task[A] = 
+    <span class="fu">Coeval</span>(session.<span class="fu">sparkContext</span>.<span class="fu">setLocalProperty</span>(<span class="st">&quot;spark.scheduler.pool&quot;</span>, pool))
+      .<span class="fu">flatMap</span>(_ =&gt; thunk)
+      .<span class="fu">doOnFinish</span>(_ =&gt; <span class="fu">Coeval</span>(session.<span class="fu">sparkContext</span>.<span class="fu">setLocalProperty</span>(<span class="st">&quot;spark.scheduler.pool&quot;</span>, <span class="kw">null</span>)))
+      .<span class="fu">task</span>
+}</code></pre></div>
+<p>And we can use it as such:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala">scala&gt; <span class="kw">val</span> test = Coeval { 
+     |   <span class="fu">println</span>(session.<span class="fu">sparkContext</span>.<span class="fu">getLocalProperty</span>(<span class="st">&quot;spark.scheduler.pool&quot;</span>)) 
+     | }.<span class="fu">onPool</span>(<span class="st">&quot;pool&quot;</span>)
+test: monix.<span class="fu">eval</span>.<span class="fu">Task</span>[Unit] = Task.<span class="fu">Eval</span>(&lt;function0&gt;)
+
+scala&gt; test.<span class="fu">runAsync</span>
+pool
+res13: monix.<span class="fu">execution</span>.<span class="fu">CancelableFuture</span>[Unit] = monix.<span class="fu">execution</span>.<span class="fu">CancelableFuture</span>$Pure@d78dd7f</code></pre></div>
+<h1 id="principled-and-composable-timing">Principled and composable timing</h1>
+<p>Timing individual operations in a big Spark job is important for tracing performance issues. Commonly, the instrumentation is so intrusive that it obscures the actual code. This is something we’d like to avoid.</p>
+<p>Other than unintrusive instrumentation, we should be able to inspect the durations of individual operations and aggregate them. We can do this nicely with the <code>WriterT</code> monad transformer.</p>
+<p><code>WriterT[F[_], L, A]</code> is a data type isomorphic to <code>F[(L, A)]</code> - a log of type <code>L</code> and a result of type <code>A</code> together in an effect <code>F[_]</code>. In our case, <code>L</code> would be something describing the timings; <code>A</code> would be the result of an operation and <code>F</code> would be <code>Task</code>.</p>
+<p>To describe the timings, we can use a simple map:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">case</span> <span class="kw">class</span> <span class="fu">Timings</span>(data: Map[String, FiniteDuration])</code></pre></div>
+<p>We’ll name this Writer monad <code>TimedTask</code>:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">type</span> TimedTask[A] = WriterT[Task, Timings, A]</code></pre></div>
+<p>When we compose the tasks together using for comprehensions, the <code>Writer</code> monad will concatenate the maps to keep the timings. For that to work, we need a Monoid instance for <code>Timings</code>:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">implicit</span> <span class="kw">val</span> timingsMonoid: Monoid[Timings] = <span class="kw">new</span> Monoid[Timings] {
+  <span class="kw">def</span> empty: Timings = <span class="fu">Timings</span>(Map.<span class="fu">empty</span>)
+  <span class="kw">def</span> <span class="fu">combine</span>(x: Timings, y: Timings): Timings = <span class="fu">Timings</span>(x.<span class="fu">data</span> ++ y.<span class="fu">data</span>)
+}</code></pre></div>
+<p>Let’s now add a combinator to lift a <code>Task[A]</code> to <code>TimedTask[A]</code>. The combinator will measure the time before and after the task and add that entry to the <code>Timings</code> map. We’ll also add a combinator that marks a task as untimed:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">implicit</span> <span class="kw">class</span> TaskOps[A](task: Task[A]) {
+  <span class="kw">def</span> <span class="fu">timed</span>(key: String): TimedTask[A] = 
+    WriterT {
+      <span class="kw">for</span> {
+        startTime &lt;- Task.<span class="fu">eval</span>(System.<span class="fu">currentTimeMillis</span>().<span class="fu">millis</span>)
+        result &lt;- task
+        endTime &lt;- Task.<span class="fu">eval</span>(System.<span class="fu">currentTimeMillis</span>().<span class="fu">millis</span>)
+      } <span class="kw">yield</span> (<span class="fu">Timings</span>(Map(key -&gt; (endTime - startTime))), result)
+    }
+
+  <span class="kw">def</span> untimed: TimedTask[A] = 
+    <span class="fu">WriterT</span>(task.<span class="fu">map</span>((Monoid[Timings].<span class="fu">empty</span>, _)))
+}</code></pre></div>
+<p>And let’s see how both <code>onPool</code> and <code>timed</code> can be used to combine operations together:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">def</span> <span class="fu">createDF</span>(data: List[Int])(<span class="kw">implicit</span> session: SparkSession): Task[DataFrame] = Task.<span class="fu">eval</span> {
+  <span class="kw">import</span> session.<span class="fu">implicits</span>._
+  <span class="kw">val</span> rdd = session.<span class="fu">sparkContext</span>.<span class="fu">parallelize</span>(data)
+
+  rdd.<span class="fu">toDF</span>
+}
+<span class="co">// createDF: (data: List[Int])(implicit session: org.apache.spark.sql.SparkSession)monix.eval.Task[org.apache.spark.sql.DataFrame]</span>
+
+<span class="kw">def</span> <span class="fu">computeAvg</span>(df: DataFrame)(<span class="kw">implicit</span> session: SparkSession): Coeval[Double] = 
+  <span class="fu">Coeval</span>(df.<span class="fu">agg</span>(f.<span class="fu">avg</span>(<span class="st">&quot;value&quot;</span>)).<span class="fu">head</span>().<span class="fu">getDouble</span>(<span class="dv">0</span>))
+<span class="co">// computeAvg: (df: org.apache.spark.sql.DataFrame)(implicit session: org.apache.spark.sql.SparkSession)monix.eval.Coeval[Double]</span>
+
+<span class="kw">def</span> <span class="fu">program</span>(data: List[Int])(<span class="kw">implicit</span> session: SparkSession): TimedTask[Double] = 
+  <span class="kw">for</span> {
+    df &lt;- <span class="fu">createDF</span>(data).<span class="fu">timed</span>(<span class="st">&quot;DataFrame creation&quot;</span>)
+    avg &lt;- <span class="fu">computeAvg</span>(df).<span class="fu">onPool</span>(<span class="st">&quot;pool&quot;</span>).<span class="fu">timed</span>(<span class="st">&quot;Average computation&quot;</span>)
+  } <span class="kw">yield</span> avg
+<span class="co">// program: (data: List[Int])(implicit session: org.apache.spark.sql.SparkSession)TimedTask[Double]</span>
+
+Await.<span class="fu">result</span>(
+  <span class="fu">program</span>(List.<span class="fu">fill</span>(<span class="dv">100</span>)(Random.<span class="fu">nextInt</span>)).<span class="fu">run</span>.<span class="fu">runAsync</span>,
+  <span class="fl">30.</span>seconds
+)
+<span class="co">// res14: (Timings, Double) = (Timings(Map(DataFrame creation -&gt; 10 milliseconds, Average computation -&gt; 93 milliseconds)),8.510343641E7)</span></code></pre></div>
+<p>We receive the result of the program along with the accumulated timings when we run the program. However, oftentimes throughout long running jobs, we’d like to unpack the intermediate timing data and log it. We can’t do this in the middle of a for-comprehension that constructs a <code>TimedTask</code>, as the <code>Writer</code> monad cannot observe the rest of the log it is being combined with. We need to do once the timed program is constructed.</p>
+<p>We can design this as a combinator of the form <code>TimeTask[A] =&gt; Task[A]</code> that decorates the resulting <code>Task</code> with a logging effect. For simplicity, we’ll use <code>println</code>, but a logger can be captured implicitly or passed to <code>logTimings</code>:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">implicit</span> <span class="kw">class</span> TimedTaskOps[A](task: TimedTask[A]) {
+  <span class="kw">def</span> <span class="fu">logTimings</span>(heading: String): Task[A] = 
+    <span class="kw">for</span> {
+      resultAndLog &lt;- task.<span class="fu">run</span>
+      (log, result) = resultAndLog
+      _ &lt;- Task.<span class="fu">eval</span> {
+        println {
+          List(
+            s<span class="st">&quot;${heading}:&quot;</span>,
+            log.<span class="fu">data</span>
+              .<span class="fu">map</span> {
+                <span class="kw">case</span> (entry, duration) =&gt; 
+                  s<span class="st">&quot;</span><span class="ch">\t</span><span class="st">${entry}: ${duration.toMillis.toString}ms&quot;</span>
+              }
+              .<span class="fu">toList</span>
+              .<span class="fu">mkString</span>(<span class="st">&quot;</span><span class="ch">\n</span><span class="st">&quot;</span>)
+          ).<span class="fu">mkString</span>(<span class="st">&quot;</span><span class="ch">\n</span><span class="st">&quot;</span>)
+        }
+      }
+    } <span class="kw">yield</span> result
+}
+<span class="co">// defined class TimedTaskOps</span></code></pre></div>
+<p>Now, we can compose two programs that log their timings when they complete:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">val</span> composed = 
+  <span class="kw">for</span> {
+    fst &lt;- <span class="fu">program</span>(List.<span class="fu">fill</span>(<span class="dv">100</span>)(Random.<span class="fu">nextInt</span>)).<span class="fu">logTimings</span>(<span class="st">&quot;First Program&quot;</span>)
+    snd &lt;- <span class="fu">program</span>(List.<span class="fu">fill</span>(<span class="dv">100</span>)(Random.<span class="fu">nextInt</span>)).<span class="fu">logTimings</span>(<span class="st">&quot;Second Program&quot;</span>)
+  } <span class="kw">yield</span> ()
+<span class="co">// composed: monix.eval.Task[Unit] = Task.FlatMap(Task@1358328089, &lt;function1&gt;)</span>
+
+Await.<span class="fu">result</span>(composed.<span class="fu">runAsync</span>, <span class="fl">30.</span>seconds)
+<span class="co">// First Program:</span>
+<span class="co">// 	DataFrame creation: 8ms</span>
+<span class="co">// 	Average computation: 68ms</span>
+<span class="co">// Second Program:</span>
+<span class="co">// 	DataFrame creation: 5ms</span>
+<span class="co">// 	Average computation: 54ms</span></code></pre></div>
+<h1 id="passing-around-state-ergonomically">Passing around state ergonomically</h1>
+<p>Jobs (and most programs in general) often involve some accumulation and transformation of state. In our case, it can be the intermediate <code>DataFrame</code> being transformed and auxillary data and results obtained throughout the job. It can get pretty tedious to pass around the data we need:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">def</span> loadKeys: Task[List[String]] = <span class="fu">Task</span>(List.<span class="fu">fill</span>(<span class="dv">10</span>)(Random.<span class="fu">nextString</span>(<span class="dv">5</span>)))
+
+<span class="kw">def</span> <span class="fu">pruneSomeKeys</span>(keys: List[String]): Task[List[String]] = <span class="fu">Task</span>(keys take <span class="dv">3</span>)
+
+<span class="kw">def</span> <span class="fu">pruneMoreKeys</span>(keys: List[String]): Task[List[String]] = <span class="fu">Task</span>(keys drop <span class="dv">1</span>)
+
+<span class="kw">def</span> <span class="fu">createDF</span>(keys: List[String])(<span class="kw">implicit</span> spark: SparkSession): Task[DataFrame] = 
+  <span class="fu">Task</span>(keys.<span class="fu">toDF</span>)
+
+<span class="kw">def</span> <span class="fu">transformDF</span>(df: DataFrame)(<span class="kw">implicit</span> spark: SparkSession): Task[DataFrame] = 
+  <span class="fu">Task</span>(df limit <span class="dv">3</span>)</code></pre></div>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">val</span> program = <span class="kw">for</span> {
+  keys       &lt;- loadKeys
+  prunedKeys &lt;- <span class="fu">pruneSomeKeys</span>(keys)
+  pruneMoreKeys &lt;- <span class="fu">pruneMoreKeys</span>(prunedKeys)
+  df            &lt;- <span class="fu">createDF</span>(prunedKeys)
+  transformed   &lt;- <span class="fu">transformDF</span>(df)
+} <span class="kw">yield</span> transformed
+<span class="co">// program: monix.eval.Task[org.apache.spark.sql.DataFrame] = Task.FlatMap(Task@1028199615, &lt;function1&gt;)</span></code></pre></div>
+<p>What happens if we need to introduce an intermediate step? For example:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">def</span> <span class="fu">pruneEvenMoreKeys</span>(keys: List[String]): Task[List[String]] = <span class="fu">Task</span>(keys)
+<span class="co">// pruneEvenMoreKeys: (keys: List[String])monix.eval.Task[List[String]]</span>
+
+<span class="kw">val</span> amendedProgram = <span class="kw">for</span> {
+  keys          &lt;- loadKeys
+  prunedKeys    &lt;- <span class="fu">pruneSomeKeys</span>(keys)
+  prunedAgain   &lt;- <span class="fu">pruneEvenMoreKeys</span>(prunedKeys)
+  pruneMoreKeys &lt;- <span class="fu">pruneMoreKeys</span>(prunedKeys)
+  df            &lt;- <span class="fu">createDF</span>(prunedKeys)
+  transformed   &lt;- <span class="fu">transformDF</span>(df)
+} <span class="kw">yield</span> transformed
+<span class="co">// amendedProgram: monix.eval.Task[org.apache.spark.sql.DataFrame] = Task.FlatMap(Task@1366903022, &lt;function1&gt;)</span></code></pre></div>
+<p>Unfortunately, we introduced a bug, as we forgot to update the data that <code>pruneMoreKeys</code> and <code>createDF</code> are operating on. This example might seem contrived, but I assure you that this has happened to me in real, production code ;-)</p>
+<p>One possible solution is to stop explicitly passing around the intermediate state entirely. The <code>StateT</code> monad transformer can help us with that. <code>StateT[F[_], S, A]</code> is isomorphic to <code>S =&gt; F[(S, A)]</code> - a function that receives an initial state and outputs a resulting state with a resulting value in an effect <code>F</code>.</p>
+<p>Similarly to how we worked with the <code>WriterT</code> monad, we first define the state that we use in our program, and partially apply the State monad along with it:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">case</span> <span class="kw">class</span> JobState(keys: List[String], df: DataFrame)
+
+<span class="kw">type</span> StateAction[A] = StateT[Task, JobState, A]</code></pre></div>
+<p>We now redefine the methods above in terms of this monad:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">def</span> loadKeys: StateAction[Unit] = StateT.<span class="fu">modifyF</span> { s =&gt; 
+  <span class="fu">Task</span>(s.<span class="fu">copy</span>(keys = List.<span class="fu">fill</span>(<span class="dv">10</span>)(Random.<span class="fu">nextString</span>(<span class="dv">5</span>))))
+}
+
+<span class="kw">def</span> pruneSomeKeys: StateAction[Unit] = StateT.<span class="fu">modifyF</span> { s =&gt;
+  <span class="fu">Task</span>(s.<span class="fu">copy</span>(keys = s.<span class="fu">keys</span> take <span class="dv">3</span>))
+}
+
+<span class="kw">def</span> pruneMoreKeys: StateAction[Unit] = StateT.<span class="fu">modifyF</span> { s =&gt;
+  <span class="fu">Task</span>(s.<span class="fu">copy</span>(keys = s.<span class="fu">keys</span> drop <span class="dv">1</span>))
+}
+
+<span class="kw">def</span> <span class="fu">createDF</span>(<span class="kw">implicit</span> spark: SparkSession): StateAction[Unit] = 
+  StateT.<span class="fu">modifyF</span> { s =&gt;
+    <span class="fu">Task</span>(s.<span class="fu">copy</span>(df = s.<span class="fu">keys</span>.<span class="fu">toDF</span>))
+  }
+
+<span class="kw">def</span> <span class="fu">transformDF</span>(<span class="kw">implicit</span> spark: SparkSession): StateAction[Unit] = 
+  StateT.<span class="fu">modifyF</span> { s =&gt;
+    <span class="fu">Task</span>(s.<span class="fu">copy</span>(df = s.<span class="fu">df</span> limit <span class="dv">3</span>))
+  }</code></pre></div>
+<p>The program composition is now much cleaner:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">val</span> stateProgram: StateAction[Unit] = <span class="kw">for</span> {
+  _ &lt;- loadKeys
+  _ &lt;- pruneSomeKeys
+  _ &lt;- pruneMoreKeys
+  _ &lt;- createDF
+  _ &lt;- transformDF
+} <span class="kw">yield</span> ()
+<span class="co">// stateProgram: StateAction[Unit] = cats.data.IndexedStateT@bfb4d80</span>
+
+Await.<span class="fu">result</span>(
+  stateProgram
+    .<span class="fu">run</span>(JobState(Nil, session.<span class="fu">sqlContext</span>.<span class="fu">emptyDataFrame</span>))
+    .<span class="fu">runAsync</span>,
+  <span class="fl">30.</span>seconds
+)
+<span class="co">// res25: (JobState, Unit) = (JobState(List(酥㵓큡趴ⱬ, ܲ퓩暹㇯䳿),[value: string]),())</span></code></pre></div>
+<p>The only issue that we might take with this design is that we shoved all the data into the state, while the <code>keys</code> aren’t needed when running <code>transformDF</code>. Additionally, we had to introduce an artificial empty state; this goes against a good practice of making illegal states unrepresentable.</p>
+<p>We can use <code>IndexedStateT</code> to model this more accurately; this is a data type similar to <code>StateT</code> that differs by having different types for input and output states. Formally, it is a function of the form <code>SA =&gt; F[(SB, A)]</code>, where <code>SA</code> and <code>SB</code> represent the input and output states.</p>
+<p>To use it, we’ll define separate states for our program:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">case</span> <span class="kw">object</span> Empty
+<span class="kw">case</span> <span class="kw">class</span> <span class="fu">ProcessingKeys</span>(keys: List[String])
+<span class="kw">case</span> <span class="kw">class</span> <span class="fu">ProcessingDF</span>(df: DataFrame)
+<span class="kw">case</span> <span class="kw">class</span> <span class="fu">Done</span>(df: DataFrame)</code></pre></div>
+<p>And we will redefine our functions again to model how the state transitions:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">def</span> loadKeys: IndexedStateT[Task, Empty.<span class="fu">type</span>, ProcessingKeys, Unit] = 
+  IndexedStateT.<span class="fu">setF</span> {
+    <span class="fu">Task</span>(<span class="fu">ProcessingKeys</span>(List.<span class="fu">fill</span>(<span class="dv">10</span>)(Random.<span class="fu">nextString</span>(<span class="dv">5</span>))))
+  }
+
+<span class="kw">def</span> pruneSomeKeys: StateT[Task, ProcessingKeys, Unit] = 
+  StateT.<span class="fu">modifyF</span> { s =&gt;
+    <span class="fu">Task</span>(s.<span class="fu">copy</span>(keys = s.<span class="fu">keys</span> take <span class="dv">3</span>))
+  }
+
+<span class="kw">def</span> pruneMoreKeys: StateT[Task, ProcessingKeys, Unit] = 
+  StateT.<span class="fu">modifyF</span> { s =&gt;
+    <span class="fu">Task</span>(s.<span class="fu">copy</span>(keys = s.<span class="fu">keys</span> drop <span class="dv">1</span>))
+  }
+
+<span class="kw">def</span> <span class="fu">createDF</span>(<span class="kw">implicit</span> spark: SparkSession): IndexedStateT[Task, ProcessingKeys, ProcessingDF, Unit] = 
+  IndexedStateT.<span class="fu">modifyF</span> { s =&gt;
+    <span class="fu">Task</span>(<span class="fu">ProcessingDF</span>(s.<span class="fu">keys</span>.<span class="fu">toDF</span>))
+  }
+
+<span class="kw">def</span> <span class="fu">transformDF</span>(<span class="kw">implicit</span> spark: SparkSession): IndexedStateT[Task, ProcessingDF, Done, Unit] = 
+  IndexedStateT.<span class="fu">modifyF</span> { s =&gt;
+    <span class="fu">Task</span>(<span class="fu">Done</span>(s.<span class="fu">df</span> limit <span class="dv">3</span>))
+  }</code></pre></div>
+<p>Note how functions that stay within the same state type are still using the plain <code>StateT</code>. This is because <code>StateT</code> is actually an alias for <code>IndexedStateT[F, S, S, A]</code> - a state transition that does not change the state type.</p>
+<p>We can now launch our program with an accurate empty, uninitialized state and get back the <code>Done</code> state:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">val</span> indexedStateProgram: IndexedStateT[Task, Empty.<span class="fu">type</span>, Done, Unit] = <span class="kw">for</span> {
+  _ &lt;- loadKeys
+  _ &lt;- pruneSomeKeys
+  _ &lt;- pruneMoreKeys
+  _ &lt;- createDF
+  _ &lt;- transformDF
+} <span class="kw">yield</span> ()
+<span class="co">// indexedStateProgram: cats.data.IndexedStateT[monix.eval.Task,Empty.type,Done,Unit] = cats.data.IndexedStateT@4efcd10a</span>
+
+Await.<span class="fu">result</span>(
+  indexedStateProgram
+    .<span class="fu">run</span>(Empty)
+    .<span class="fu">runAsync</span>,
+  <span class="fl">30.</span>seconds
+)
+<span class="co">// res30: (Done, Unit) = (Done([value: string]),())</span></code></pre></div>
+<p>Note that we would get a compilation failure if we mix up the order of the actions:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala">scala&gt; <span class="kw">val</span> fail: IndexedStateT[Task, Empty.<span class="fu">type</span>, Done, Unit] = <span class="kw">for</span> {
+     |   _ &lt;- loadKeys
+     |   _ &lt;- pruneSomeKeys
+     |   _ &lt;- createDF
+     |   _ &lt;- pruneMoreKeys
+     |   _ &lt;- transformDF
+     | } <span class="kw">yield</span> ()
+&lt;console&gt;:<span class="dv">64</span>: error: <span class="kw">type</span> mismatch;
+ found   : cats.<span class="fu">data</span>.<span class="fu">IndexedStateT</span>[monix.<span class="fu">eval</span>.<span class="fu">Task</span>,ProcessingDF,Done,Unit]
+ required: cats.<span class="fu">data</span>.<span class="fu">IndexedStateT</span>[monix.<span class="fu">eval</span>.<span class="fu">Task</span>,ProcessingKeys,?,?]
+         _ &lt;- transformDF
+           ^
+&lt;console&gt;:<span class="dv">63</span>: error: polymorphic expression cannot be instantiated to expected <span class="kw">type</span>;
+ found   : [B, SC]cats.<span class="fu">data</span>.<span class="fu">IndexedStateT</span>[monix.<span class="fu">eval</span>.<span class="fu">Task</span>,ProcessingKeys,SC,B]
+ required: cats.<span class="fu">data</span>.<span class="fu">IndexedStateT</span>[monix.<span class="fu">eval</span>.<span class="fu">Task</span>,ProcessingDF,Done,Unit]
+         _ &lt;- pruneMoreKeys
+           ^</code></pre></div>
+<p>If we want to combine the timing functionality from the previous section, that’s also entirely possible; we’d need to define a monad stack of <code>IndexedStateT[TimedTask, SA, SB, A]</code> and define the <code>timed</code> combinators for this stack. To be honest, though, working with concrete transformers in Scala is pretty boilerplate-heavy. A much more ergonomic approach is using tagless final to abstract over the transformers; that’s a subject to an entirely different post, though.</p>
+<h1 id="summary">Summary</h1>
+<p>Through these few combinators we’ve defined, we saw how we can easily and lightly wrap some of Spark’s API to regain properties we like about programs written with functional programming. It is admittedly not a complete approach: typesafety is still missing from many of the <code>DataFrame</code> methods and <code>nulls</code> may creep up here and there. But it’s definitely an improvement!</p>
+<p>I hope you found these examples useful. Feel free to hit me up on twitter (<span class="citation">[@itrvd]</span>(https://twitter.com/itrvd)) if you’ve got any questions.</p>
+<p><em>This post was typechecked by <a href="https://github.com/tpolecat/tut">tut</a> on Scala 2.11.11 with Spark 2.2.0, cats 1.0.0-RC1 and Monix 3.0.0-M2.</em></p>
+</section>
+
+    </body>
+</html>
