@@ -1,0 +1,215 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en">
+    <head>
+  <meta charset="utf-8">
+  <title>
+    
+      Safe(r) mappings in Slick with Shapeless &ndash;
+    
+    Itamar's Blog
+  </title>
+
+  <meta name="author" content="Itamar's Blog" />
+  <meta name="description" content="Functors, and stuff" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+
+  <link href="https://netdna.bootstrapcdn.com/font-awesome/4.0.3/css/font-awesome.css" rel="stylesheet" />
+  <link rel="stylesheet" href="../css/base.css" type="text/css" media="screen, projection" />
+  <link rel="stylesheet" href="../css/pygments.css" type="text/css" />
+  <link rel="stylesheet" href="../css/syntax.css" type="text/css" />
+  <link media="only screen and (max-device-width: 480px)" href="../css/mobile.css" type="text/css" rel="stylesheet" />
+  <link media="only screen and (device-width: 768px)" href="../css/mobile.css" type="text/css" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css?family=Yanone+Kaffeesatz" rel="stylesheet" type="text/css">
+</head>
+
+    <body>
+        <section class="sidebar">
+  <section class="name">
+    <a href="../">
+      <span id="fname">Itamar's</span>
+      <span id="fname">Blog.</span>
+    </a>
+  </section>
+
+  <section class="meta">
+    <a href="https://github.com/iravid" target="_blank" title="Follow me on GitHub" aria-label="Follow me on GitHub"><i class="fa fa-github"></i></a>
+    <a href="https://twitter.com/itrvd" target="_blank" title="Follow me on Twitter" aria-label="Follow me on Twitter"><i class="fa fa-twitter"></i></a>
+  </section>
+
+  <section class="sections">
+    <ul>
+      <li><a href="../index.html">posts</a></li>
+    </ul>
+  </section>
+</section>
+
+
+        <section class="content">
+  <h1>
+    <a href="../posts/slick-and-shapeless.html">Safe(r) mappings in Slick with Shapeless</a>
+  </h1>
+
+  <section class="byline">
+    February 21, 2018
+  </section>
+
+  <p>A colleague asked me today if there’s any way to reduce the boilerplate around mapping common columns in data types and database tables; for example, the <code>id</code> column or <code>created_at</code> and <code>updated_at</code>. We’re using Slick, so this post will be based around that.</p>
+<p>Before diving into the Slick APIs, let’s first get a basic question out of the way: how should we represent the <code>id</code> (and other metadata) on our data types themselves? We’ll use the venerable <code>Person</code> data type as our running example:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">case</span> <span class="kw">class</span> <span class="fu">Person</span>(name: String, age: Int)</code></pre></div>
+<h1 id="modeling-metadata-fields-on-case-classes">Modeling metadata fields on case classes</h1>
+<p>The following straightforward representation first comes to mind:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">case</span> <span class="kw">class</span> <span class="fu">Person</span>(id: Int, name: String, age: Int)</code></pre></div>
+<p>What’s the problem with it? To see it clearly, let’s consider a method that handles the <code>name</code> and <code>age</code> inputs from a user and saves them as a new entry in a database:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">import</span> monix.<span class="fu">eval</span>.<span class="fu">Task</span>
+
+<span class="kw">trait</span> DB {
+  <span class="kw">def</span> <span class="fu">insert</span>(person: Person): Task[Unit]
+}
+
+<span class="kw">def</span> <span class="fu">handleUserInput</span>(db: DB, name: String, age: Int): Task[Unit] = 
+  db.<span class="fu">insert</span>(<span class="fu">Person</span>(???, name, age))</code></pre></div>
+<p>We hit a roadblock pretty early where we must make up a value for the <code>id</code> field. Well, no worries- let’s just make it optional! We’ll also modify the <code>DB</code> interface to return the <code>Person</code> after it has been assigned an ID by the database:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">case</span> <span class="kw">class</span> <span class="fu">Person</span>(id: Option[Int], name: String, age: Int)
+
+<span class="kw">trait</span> DB {
+  <span class="kw">def</span> <span class="fu">insert</span>(person: Person): Task[Person]
+}
+
+<span class="kw">def</span> <span class="fu">handleUserInput</span>(db: DB, name: String, age: Int): Task[Person] = 
+  db.<span class="fu">insert</span>(<span class="fu">Person</span>(None, name, age))</code></pre></div>
+<p>This works, but it’s not optimal. Every time we handle an instance of <code>Person</code>, we’ll need to do an awkward dance with <code>id</code>’s optionaliy; essentially, we’re making an <strong>invalid</strong> state representable. Which is exactly the opposite of what we should try to achieve with a capable type system. The <code>id</code> field cannot and will never be empty.</p>
+<h1 id="making-invalid-states-unrepresentable">Making invalid states unrepresentable</h1>
+<p>We can try and approach the solution from our desired interface for reading and writing data from the database: when we write data, we supply all fields but <code>id</code>, and get back both <code>id</code> and the rest of <code>Person</code>. When we read data, we get back an <code>Option[Person]</code>:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">trait</span> DB {
+  <span class="kw">def</span> <span class="fu">insert</span>(name: String, age: Int): Task[Person]
+  <span class="kw">def</span> <span class="fu">query</span>(id: Int): Task[Option[Person]]
+}</code></pre></div>
+<p>This is getting closer, but has the unfortunate effect of replicating all of the <code>Person</code> fields on all method signatures requiring interaction with it. Instead, we can use this handy representation:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">case</span> <span class="kw">class</span> WithId[T](id: Long, data: T)
+<span class="kw">case</span> <span class="kw">class</span> <span class="fu">Person</span>(name: String, age: Int)
+
+<span class="kw">type</span> Row = WithId[Person]</code></pre></div>
+<p>We can now model the database interactions safely and correctly:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">trait</span> DB {
+  <span class="kw">def</span> <span class="fu">insert</span>(person: Person): Task[WithId[Person]]
+  <span class="kw">def</span> <span class="fu">query</span>(id: Int): Task[Option[Person]]
+}</code></pre></div>
+<p>So, back to Slick.</p>
+<h1 id="functionalrelational-mapping-for-withidt">Functional/relational mapping for WithId[T]</h1>
+<p>Using this representation carries an unfortunate repetition for mapping the <code>id</code> column with the rest of <code>Person</code>’s data. This boilerplate can be higher if there are more such database assigned fields. Here’s the first version of the Slick schema for the <code>Person</code> table:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">import</span> slick.<span class="fu">jdbc</span>.<span class="fu">H2Profile</span>.<span class="fu">api</span>._
+
+<span class="kw">class</span> <span class="fu">People</span>(tag: Tag) <span class="kw">extends</span> Table[WithId[Person]](tag, <span class="st">&quot;people&quot;</span>) {
+  <span class="kw">def</span> id = column[Long](<span class="st">&quot;id&quot;</span>, O.<span class="fu">AutoInc</span>)
+  <span class="kw">def</span> name = column[String](<span class="st">&quot;name&quot;</span>)
+  <span class="kw">def</span> age = column[Int](<span class="st">&quot;age&quot;</span>)
+
+  <span class="kw">def</span> * = (id, name, age) &lt;&gt; (
+    { <span class="kw">case</span> (id, name, age) =&gt; <span class="fu">WithId</span>(id, <span class="fu">Person</span>(name, age)) },
+    { p: WithId[Person] =&gt; Some((p.<span class="fu">id</span>, p.<span class="fu">data</span>.<span class="fu">name</span>, p.<span class="fu">data</span>.<span class="fu">age</span>)) }
+  )
+}</code></pre></div>
+<p>We have to manually construct and deconstruct the instance of <code>WithId[Person]</code> in the <code>*</code> projection method, and cannot use the handly <code>Person.apply</code> and <code>Person.unapply</code> methods. Pretty unfortunate and annoying. What if, given a tuple <code>t: (Long, String, Int)</code>, we could generate a function call to <code>WithId(t._1, Person(t._2, t._3))</code>? And conversely, given <code>p: WithId[Person]</code>, generate a value <code>Some((p.id, p.data.name, p.data.age))</code>? Extra points if we could do this generically forall <code>T</code>.</p>
+<p>Whenever I see operations that reassociate tuples, add fields to tuples and in general abstract over amount and types of fields, I turn to Shapeless.</p>
+<h1 id="lessening-the-projection-boilerplate">Lessening the projection boilerplate</h1>
+<p>Our objective is to write generic versions of the following two functions, that Slick’s API requires when mapping the projection to/from our data types:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">def</span> <span class="fu">construct</span>(data: (Long, String, Int)): WithId[Person] = ???
+<span class="kw">def</span> <span class="fu">deconstruct</span>(p: WithId[Person]): Option[(Long, String, Int)] = ???</code></pre></div>
+<p>The following actions seem feasible for performing <code>construct</code> generically:</p>
+<ol style="list-style-type: decimal">
+<li>Convert <code>(Long, String, Int)</code> to an HList - <code>Long :: String :: Int :: HNil</code>.</li>
+<li>Split the HList to <code>id: Long</code> and <code>data: String :: Int :: HNil</code>.</li>
+<li>Convert <code>data</code> back to the <code>Person</code> case class.</li>
+<li>Wrap the created <code>Person</code> instance in <code>WithId(id, _)</code>.</li>
+</ol>
+<p>The inverse, <code>deconstruct</code>, is pretty similar.</p>
+<p>Ok! Let’s do this. We need 3 typeclasses from shapeless:</p>
+<ol style="list-style-type: decimal">
+<li><code>Generic.Aux[Product, Out]</code> will let us move between tuples and HLists;</li>
+<li><code>IsHCons.Aux[In, Head, Tail]</code> will let us assert that the resulting HList has a <code>Long</code> up front;</li>
+<li><code>Tupler.Aux[In, Tuple]</code> will let us go from an HList back to a tuple.</li>
+</ol>
+<p>Here’s our generic <code>construct</code>:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">import</span> shapeless.{ HList, ::, Generic }
+<span class="kw">import</span> shapeless.<span class="fu">ops</span>.<span class="fu">hlist</span>.{ IsHCons, Tupler }
+
+<span class="kw">def</span> construct[In &lt;: Product, All &lt;: HList, Data &lt;: HList, Out](in: In)(
+  <span class="kw">implicit</span>
+  inGen: Generic.<span class="fu">Aux</span>[In, All],
+  uncons: IsHCons.<span class="fu">Aux</span>[All, Long, Data],
+  outGen: Generic.<span class="fu">Aux</span>[Out, Data]
+): WithId[Out] = {
+  <span class="kw">val</span> all = inGen.<span class="fu">to</span>(in)
+
+  <span class="kw">val</span> id = uncons.<span class="fu">head</span>(all)
+  <span class="kw">val</span> data = uncons.<span class="fu">tail</span>(all)
+
+  <span class="kw">val</span> out = outGen.<span class="fu">from</span>(data)
+
+  <span class="fu">WithId</span>(id, out)
+}</code></pre></div>
+<p>Surprisingly short and succinct. Let’s see that it’s actually working:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala">scala&gt; <span class="kw">val</span> personWithId: WithId[Person] = <span class="fu">construct</span>((4L, <span class="st">&quot;Person&quot;</span>, <span class="dv">42</span>))
+personWithId: WithId[Person] = <span class="fu">WithId</span>(<span class="dv">4</span>,<span class="fu">Person</span>(Person,<span class="dv">42</span>))</code></pre></div>
+<p>The above only works when adding a type annotation to <code>personWithId</code>, otherwise <code>Nothing</code> will be inferred for the <code>Out</code> parameter. In the Slick schema, we can’t quite conveniently annotate the projection. Instead, we’ll use Rob Norris’s kinda-curried type application trick so we can specify only the <code>Out</code> parameter:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">class</span> ConstructHelper[Out] {
+  <span class="kw">def</span> apply[In &lt;: Product, All &lt;: HList, Data &lt;: HList](in: In)(
+    <span class="kw">implicit</span>
+    inGen: Generic.<span class="fu">Aux</span>[In, All],
+    uncons: IsHCons.<span class="fu">Aux</span>[All, Long, Data],
+    outGen: Generic.<span class="fu">Aux</span>[Out, Data]
+  ): WithId[Out] = {
+    <span class="kw">val</span> all = inGen.<span class="fu">to</span>(in)
+
+    <span class="kw">val</span> id = uncons.<span class="fu">head</span>(all)
+    <span class="kw">val</span> data = uncons.<span class="fu">tail</span>(all)
+
+    <span class="kw">val</span> out = outGen.<span class="fu">from</span>(data)
+
+    <span class="fu">WithId</span>(id, out)
+  }
+}
+<span class="kw">def</span> construct[Out] = <span class="kw">new</span> ConstructHelper[Out]</code></pre></div>
+<p>And we can now use it as such:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala">scala&gt; <span class="kw">val</span> personWithId = construct[Person]((4L, <span class="st">&quot;Person&quot;</span>, <span class="dv">42</span>))
+personWithId: WithId[Person] = <span class="fu">WithId</span>(<span class="dv">4</span>,<span class="fu">Person</span>(Person,<span class="dv">42</span>))</code></pre></div>
+<p>The inverse operation, <code>deconstruct</code>, is much simpler:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">def</span> deconstruct[In, Data &lt;: HList, Out &lt;: Product](in: WithId[In])(
+  <span class="kw">implicit</span>
+  inGen: Generic.<span class="fu">Aux</span>[In, Data],
+  dataTupler: Tupler.<span class="fu">Aux</span>[Long :: Data, Out]
+): Option[Out] = 
+  Some(<span class="fu">dataTupler</span>(in.<span class="fu">id</span> :: inGen.<span class="fu">to</span>(in.<span class="fu">data</span>)))</code></pre></div>
+<p>And is used as such:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala">scala&gt; <span class="fu">deconstruct</span>(<span class="fu">WithId</span>(4L, <span class="fu">Person</span>(<span class="st">&quot;Person&quot;</span>, <span class="dv">42</span>)))
+res6: Option[(Long, String, Int)] = Some((<span class="dv">4</span>,Person,<span class="dv">42</span>))</code></pre></div>
+<p>And we can now happily scrap away some boilerplate from our schema definition:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">class</span> <span class="fu">People</span>(tag: Tag) <span class="kw">extends</span> Table[WithId[Person]](tag, <span class="st">&quot;people&quot;</span>) {
+  <span class="kw">def</span> id = column[Long](<span class="st">&quot;id&quot;</span>, O.<span class="fu">AutoInc</span>)
+  <span class="kw">def</span> name = column[String](<span class="st">&quot;name&quot;</span>)
+  <span class="kw">def</span> age = column[Int](<span class="st">&quot;age&quot;</span>)
+
+  <span class="kw">def</span> * = (id, name, age) &lt;&gt; (
+    construct[Person](_),
+    <span class="fu">deconstruct</span>(_: WithId[Person])
+  )
+}</code></pre></div>
+<p>I couldn’t get rid of the type annotation on <code>deconstruct</code>, even when I used the partially-applied types trick and moved <code>In</code> to the helper class. Happy to hear any ideas anyone has.</p>
+<p>We can even move some of the definitions to a base class:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">abstract</span> <span class="kw">class</span> TableWithId[T](tag: Tag, tableName: String)
+  <span class="kw">extends</span> Table[WithId[T]](tag, tableName) {
+  <span class="kw">def</span> id = column[Long](<span class="st">&quot;id&quot;</span>, O.<span class="fu">AutoInc</span>)
+}</code></pre></div>
+<p>Ok, that’s it. Here are a few next steps I might pursue, time permitting:</p>
+<ul>
+<li>pack away both calls to <code>construct</code> and <code>deconstruct</code> in a function that returns a tuple of <code>(Tuple =&gt; Data, Data =&gt; Option[Tuple])</code>;</li>
+<li>add support for nested case classes - currently this won’t work because we need to compute a flat representation of the HList;</li>
+<li>perhaps add an implicit enrichment to <code>TableQuery[People]</code> and add a version of <code>+=</code> that takes a <code>Person</code> rather than <code>WithId[Person]</code>, which makes more sense.</li>
+</ul>
+<p>Hope you’ll find this helpful!</p>
+<p>This post was typechecked with tut on Scala 2.12.4 with shapeless 2.3.3. The parts that use Slick were tested manually because tut refuses to compile them, for some reason.</p>
+</section>
+
+    </body>
+</html>
