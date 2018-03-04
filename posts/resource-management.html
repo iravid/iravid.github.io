@@ -1,0 +1,302 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en">
+    <head>
+  <meta charset="utf-8">
+  <title>
+    
+      ManagedT: Compositional resource management &ndash;
+    
+    Itamar's Blog
+  </title>
+
+  <meta name="author" content="Itamar's Blog" />
+  <meta name="description" content="Functors, and stuff" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+
+  <link href="https://netdna.bootstrapcdn.com/font-awesome/4.0.3/css/font-awesome.css" rel="stylesheet" />
+  <link rel="stylesheet" href="../css/base.css" type="text/css" media="screen, projection" />
+  <link rel="stylesheet" href="../css/pygments.css" type="text/css" />
+  <link rel="stylesheet" href="../css/syntax.css" type="text/css" />
+  <link media="only screen and (max-device-width: 480px)" href="../css/mobile.css" type="text/css" rel="stylesheet" />
+  <link media="only screen and (device-width: 768px)" href="../css/mobile.css" type="text/css" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css?family=Yanone+Kaffeesatz" rel="stylesheet" type="text/css">
+</head>
+
+    <body>
+        <section class="sidebar">
+  <section class="name">
+    <a href="../">
+      <span id="fname">Itamar's</span>
+      <span id="fname">Blog.</span>
+    </a>
+  </section>
+
+  <section class="meta">
+    <a href="https://github.com/iravid" target="_blank" title="Follow me on GitHub" aria-label="Follow me on GitHub"><i class="fa fa-github"></i></a>
+    <a href="https://twitter.com/itrvd" target="_blank" title="Follow me on Twitter" aria-label="Follow me on Twitter"><i class="fa fa-twitter"></i></a>
+  </section>
+
+  <section class="sections">
+    <ul>
+      <li><a href="../index.html">posts</a></li>
+    </ul>
+  </section>
+</section>
+
+
+        <section class="content">
+  <h1>
+    <a href="../posts/resource-management.html">ManagedT: Compositional resource management</a>
+  </h1>
+
+  <section class="byline">
+    March  3, 2018
+  </section>
+
+  <p>When bootstrapping a new application, you’d typically like to nicely structure the way resources (which we’ll define in a moment) are acquired. Resources should be allowed to depend on each other, imposing a sequential order on the startup sequence. This pretty much falls out of the module structure:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">import</span> monix.<span class="fu">eval</span>.<span class="fu">Task</span>
+
+<span class="kw">trait</span> KinesisWriter
+<span class="kw">trait</span> EventWriter
+<span class="kw">trait</span> App
+
+<span class="kw">def</span> acquireKinesis: Task[KinesisWriter] = ???
+<span class="kw">def</span> <span class="fu">acquireEventWriter</span>(k: KinesisWriter): Task[EventWriter] = ???
+<span class="kw">def</span> <span class="fu">runApp</span>(k: KinesisWriter, e: EventWriter): Task[Unit] = ???</code></pre></div>
+<p>Ruling out usage of naughty <code>null</code> s and <code>var</code> s, it is impossible to avoid sequential ordering of <code>acquireKinesisWriter</code>, <code>acquireEventWriter</code> and <code>runApp</code> when starting up. However, say we also have <code>close</code> methods which must be called on those writers:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">trait</span> KinesisWriter {
+  <span class="kw">def</span> close: Task[Unit] = Task.<span class="fu">unit</span>
+}
+
+<span class="kw">trait</span> EventWriter {
+  <span class="kw">def</span> close: Task[Unit] = Task.<span class="fu">unit</span>
+}</code></pre></div>
+<p>It’s pretty important to call these <code>close</code> methods in the right order - which is usually the reverse acquisition order. There are no function arguments to guide us in this case, so care must be taken; the <code>EventWriter</code> might be buffering events to be written to Kinesis, and if we close that <code>KinesisWriter</code> under its feet, some writes might be lost.</p>
+<p>Composing resource acquisition means composing functions that return <code>Task</code>. That’s monadic composition, and we can use for-comprehensions for that:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">def</span> acquireKinesis = <span class="fu">Task</span>(<span class="kw">new</span> KinesisWriter {})
+<span class="kw">def</span> <span class="fu">acquireEventWriter</span>(kinesis: KinesisWriter) = <span class="fu">Task</span>(<span class="kw">new</span> EventWriter {})
+<span class="kw">def</span> <span class="fu">runApp</span>(eventWriter: EventWriter) = Task.<span class="fu">unit</span>
+
+<span class="kw">val</span> appTask = <span class="kw">for</span> {
+  kinesis     &lt;- acquireKinesis
+  eventWriter &lt;- <span class="fu">acquireEventWriter</span>(kinesis)
+  _           &lt;- <span class="fu">runApp</span>(eventWriter)
+} <span class="kw">yield</span> ()</code></pre></div>
+<p>This doesn’t do anything for the cleanup handlers. Imperative programming offers us the <code>try-catch-finally</code> statement, that looks like this:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">val</span> resource = <span class="fu">acquire</span>()
+
+<span class="kw">try</span> {
+  <span class="fu">use</span>(resource)
+} <span class="kw">finally</span> {
+  <span class="fu">release</span>(resource)
+}</code></pre></div>
+<p>This assures that <code>release(resource)</code> will be called, regardless if <code>use(resource)</code> throws or not. If we want to compose resource acquisition, we nest the blocks. This doesn’t handle any sort of effect; errors are signaled through exceptions.</p>
+<h1 id="bracket"><code>bracket</code></h1>
+<p><code>bracket</code> is a functional version of <code>try-catch-finally</code>, that can be used with effects. Here’s <code>bracket</code> from <code>monix.eval.Task</code>’s master branch, slightly modified to be non-infix:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">object</span> Task {
+  <span class="kw">def</span> bracket[R, A](acquire: Task[R])(use: R =&gt; Task[A])(release: R =&gt; Task[Unit]): Task[A]
+}</code></pre></div>
+<p><code>acquire</code> is a value that produces the resource; <code>use</code> is a function that uses the resource to produce an <code>A</code>; <code>release</code> is a function that releases the resource.</p>
+<p>We can write our own version of <code>bracket</code> (that is slightly broken in that it doesn’t take cancellation into account, but we can leave this out for now) using combinators from the <code>MonadError[Task, Throwable]</code> typeclass instance:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">import</span> cats.<span class="fu">implicits</span>._
+
+<span class="kw">def</span> bracket[R, A](acquire: Task[R])(use: R =&gt; Task[A])(release: R =&gt; Task[Unit]): Task[A] = 
+  <span class="kw">for</span> {
+    resource      &lt;- acquire
+    resultOrError &lt;- <span class="fu">use</span>(resource).<span class="fu">attempt</span>
+    result        &lt;- resultOrError <span class="kw">match</span> {
+                       <span class="kw">case</span> <span class="fu">Right</span>(a) =&gt;
+                         <span class="fu">release</span>(resource).<span class="fu">map</span>(_ =&gt; a)
+
+                       <span class="kw">case</span> <span class="fu">Left</span>(e)  =&gt; 
+                         <span class="fu">release</span>(resource).<span class="fu">flatMap</span>(_ =&gt; e.<span class="fu">raiseError</span>[Task, A])
+                     }
+  } <span class="kw">yield</span> result</code></pre></div>
+<p>We may want to convince ourselves that this function works given the various failure points it has:</p>
+<ul>
+<li>if <code>acquire</code> fails, nothing happens and the error is returned;</li>
+<li>if <code>use</code> fails, its error will be surfaced in the <code>Either</code> returned from <code>attempt</code>. This effectively means that line will always succeed;</li>
+<li>if <code>release</code> in the <code>Right</code> case fails, its error will be returned from <code>bracket</code> and <code>a</code> would be discarded;</li>
+<li>if <code>release</code> in the <code>Left</code> case fails, its error will be returned from <code>bracket</code> and the original error will be discarded.</li>
+</ul>
+<p>The behavior in the last two points might be arguable, in that it may make sense to always return <code>a</code> or to return the error from <code>use</code>, but the important point here is that <code>release</code> will always be called.</p>
+<p>Note that we only used <code>map</code>, <code>flatMap</code>, <code>attempt</code> and <code>raiseError</code>. That means we can abstract <code>Task</code> out too, and constrain <code>F[_]</code> to have an instance of <code>MonadError</code>:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">import</span> cats.<span class="fu">MonadError</span>
+
+<span class="kw">def</span> bracket[F[_], R, A](acquire: F[R])(use: R =&gt; F[A])(
+  release: R =&gt; F[Unit])(<span class="kw">implicit</span> F: MonadError[F, Throwable]): F[A] = 
+  <span class="kw">for</span> {
+    resource      &lt;- acquire
+    resultOrError &lt;- <span class="fu">use</span>(resource).<span class="fu">attempt</span>
+    result        &lt;- resultOrError <span class="kw">match</span> {
+                       <span class="kw">case</span> <span class="fu">Right</span>(a) =&gt;
+                         <span class="fu">release</span>(resource).<span class="fu">map</span>(_ =&gt; a)
+
+                       <span class="kw">case</span> <span class="fu">Left</span>(e)  =&gt; 
+                         <span class="fu">release</span>(resource).<span class="fu">flatMap</span>(_ =&gt; e.<span class="fu">raiseError</span>[F, A])
+                     }
+  } <span class="kw">yield</span> result</code></pre></div>
+<p>We can now build our application as such:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">trait</span> KinesisWriter {
+  <span class="kw">def</span> close: Task[Unit] = Task.<span class="fu">unit</span>
+}
+<span class="kw">object</span> KinesisWriter {
+  <span class="kw">def</span> acquire: Task[KinesisWriter] = <span class="fu">Task</span>(<span class="kw">new</span> KinesisWriter {})
+}
+
+<span class="kw">trait</span> EventWriter {
+  <span class="kw">def</span> close: Task[Unit] = Task.<span class="fu">unit</span>
+}
+<span class="kw">object</span> EventWriter {
+  <span class="kw">def</span> <span class="fu">acquire</span>(k: KinesisWriter): Task[EventWriter] = <span class="fu">Task</span>(<span class="kw">new</span> EventWriter {})
+}
+
+<span class="kw">val</span> app = <span class="fu">bracket</span>(KinesisWriter.<span class="fu">acquire</span>) { kw =&gt;
+  <span class="fu">bracket</span>(EventWriter.<span class="fu">acquire</span>(kw)) { ew =&gt;
+    Task.<span class="fu">unit</span>
+  }(_.<span class="fu">close</span>)
+}(_.<span class="fu">close</span>)</code></pre></div>
+<p>One can only imagine how that would look if we have 15 resources with complex dependencies between them. This is the exact opposite of compositionality; everything has to be lumped together. <code>bracket</code> looks like a good direction, but we have to improve on it to make it actually nice to use.</p>
+<h1 id="managedt">ManagedT</h1>
+<p>When in doubt, turn to Haskell: most mundane functional programming problems have already been explored there. Fabio Labella helpfully pointed me to Gabriel Gonzalez’ <a href="https://hackage.haskell.org/package/managed">managed</a> library that does exactly what we’ll construct here.</p>
+<p>First, let’s re-arrange the <code>bracket</code> signature slightly:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">def</span> bracketCurried[F[_], R, A](acquire: F[R])(release: R =&gt; F[Unit])(
+  <span class="kw">implicit</span> F: MonadError[F, Throwable]): (R =&gt; F[A]) =&gt; F[A] = { use =&gt;
+  <span class="fu">bracket</span>(acquire)(use)(release)
+}</code></pre></div>
+<p>What we’ve done is return a function that, when given the <code>use</code> action, will run the <code>acquision</code>, <code>use</code> and <code>cleanup</code> actions. By using the original <code>bracket</code>, we show ourselves that this version is compatible with the previous.</p>
+<p>We can make another mechanical change: instead of currying the function, let’s make this a case class (called <code>ManagedT</code>) and move <code>acquire</code> and <code>release</code> to the constructor:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">case</span> <span class="kw">class</span> ManagedT[F[_], R](acquire: F[R])(release: R =&gt; F[Unit])(
+  <span class="kw">implicit</span> F: MonadError[F, Throwable]) {
+
+  <span class="kw">def</span> apply[A](use: R =&gt; F[A]): F[A] = <span class="fu">bracket</span>(acquire)(use)(release)
+}</code></pre></div>
+<p>We also moved <code>A</code> into the method definition, so the same instance of <code>ManagedT</code> can be used with multiple <code>use</code> actions, not necessarily of the same type. Again, still using the original <code>bracket</code>.</p>
+<p>What we have now is a data type that represents resource acquisition and release, decoupled from the code that uses it. We now only need to be able to compose several instances of this data type.</p>
+<h1 id="monadmanagedtf">Monad[ManagedT[F, ?]]</h1>
+<p>When I see a data type that needs to be composed sequentially, monads immediately pop into my mind. Here are the <code>ManagedT</code> instances for the Kinesis and Event writers:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">val</span> kinesis = <span class="fu">ManagedT</span>(KinesisWriter.<span class="fu">acquire</span>)(_.<span class="fu">close</span>)
+<span class="kw">def</span> <span class="fu">event</span>(k: KinesisWriter) = <span class="fu">ManagedT</span>(EventWriter.<span class="fu">acquire</span>(k))(_.<span class="fu">close</span>)</code></pre></div>
+<p>The monad smell grows stronger as we see that the form of <code>event</code> is <code>KinesisWriter =&gt; ManagedT[Task, EventWriter]</code> - a Kleisli arrow for <code>ManagedT[Task, ?]</code>. Let’s write the <code>pure</code> and <code>flatMap</code> functions required to write the <code>Monad</code> instance.</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">def</span> pure[F[_], R](r: R)(<span class="kw">implicit</span> F: MonadError[F, Throwable]) = 
+  <span class="fu">ManagedT</span>(r.<span class="fu">pure</span>[F])(_ =&gt; F.<span class="fu">unit</span>)</code></pre></div>
+<p>What <code>pure</code> does for <code>ManagedT</code> is lift a regular value into <code>ManagedT</code> with no cleanup action. That’s simple enough. <code>flatMap</code> is next. We should look at the expected signature first:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">def</span> flatMap[F[_], R1, R2](fr1: ManagedT[F, R1])(fr2: R1 =&gt; ManagedT[F, R2])(
+  <span class="kw">implicit</span> F: MonadError[F, Throwable]): ManagedT[F, R2]</code></pre></div>
+<p>This says that we must be able to use a managed <code>R1</code> in order to create a managed <code>R2</code>. That sounds like nesting resources. Here’s a first try:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala">scala&gt; <span class="kw">def</span> flatMap[F[_], R1, R2](fr1: ManagedT[F, R1])(fr2: R1 =&gt; ManagedT[F, R2])(
+     |   <span class="kw">implicit</span> F: MonadError[F, Throwable]): ManagedT[F, R2] =
+     |   ManagedT {
+     |     fr1 { r1 =&gt;
+     |       <span class="fu">fr2</span>(r1)(???)
+     |     }
+     |   } { r2 =&gt; ??? }
+&lt;console&gt;:<span class="dv">22</span>: error: <span class="kw">type</span> mismatch;
+ found   : R1 =&gt; F[Nothing]
+ required: R1 =&gt; F[A]
+           fr1 { r1 =&gt;
+                    ^
+&lt;console&gt;:<span class="dv">22</span>: error: <span class="kw">type</span> mismatch;
+ found   : F[Nothing]
+ required: F[R]
+Note: Nothing &lt;: R, but <span class="kw">type</span> F is invariant in <span class="kw">type</span> _.
+You may wish to define _ as +_ instead. (SLS <span class="fl">4.5</span>)
+           fr1 { r1 =&gt;
+               ^</code></pre></div>
+<p>This is pretty awkward. We’re really contorting ourselves to fit the composed <code>ManagedT</code> into the existing constructor. What we really want is to create a new instance of <code>ManagedT[F, R2]</code> that will reuse <code>fr1</code> and <code>fr2</code> upon execution. We can rearrange the class layout again to make this possible:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">abstract</span> <span class="kw">class</span> ManagedT[F[_], R] {
+  <span class="kw">def</span> apply[A](use: R =&gt; F[A]): F[A]
+}
+<span class="kw">object</span> ManagedT {
+  <span class="kw">def</span> apply[F[_], R](acquire: =&gt; F[R])(cleanup: R =&gt; F[Unit])(
+    <span class="kw">implicit</span> F: MonadError[F, Throwable]): ManagedT[F, R] = 
+    <span class="kw">new</span> ManagedT[F, R] {
+      <span class="kw">def</span> apply[A](use: R =&gt; F[A]): F[A] = <span class="fu">bracket</span>(acquire)(use)(cleanup)
+    }
+}</code></pre></div>
+<p>Again, purely mechanical. Instead of capturing <code>acquire</code> and <code>cleanup</code> in the class constructor, we capture them when creating an anonymous instance in the <code>ManagedT.apply</code> function. We can now actually skip on providing <code>acquire</code> and <code>cleanup</code>; this is great for <code>flatMap</code>:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">def</span> flatMap[F[_], R1, R2](fr1: ManagedT[F, R1])(fr2: R1 =&gt; ManagedT[F, R2])(
+  <span class="kw">implicit</span> F: MonadError[F, Throwable]): ManagedT[F, R2] = 
+  <span class="kw">new</span> ManagedT[F, R2] {
+    <span class="kw">def</span> apply[A](use: R2 =&gt; F[A]): F[A] = 
+      fr1 { r1 =&gt;
+        <span class="fu">fr2</span>(r1) { r2 =&gt;
+          <span class="fu">use</span>(r2)
+        }
+      }
+  }</code></pre></div>
+<p>The definition basically falls out of the types. We no longer have to provide an acquire or cleanup action; we just delegate to the instances that were passed as arguments ot the function. To convince ourselves that this is doing the right thing, we can trace through what is happening in the following expression:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">val</span> composed = <span class="fu">flatMap</span>(kinesis)(k =&gt; <span class="fu">event</span>(k))
+<span class="kw">val</span> app = composed { eventWriter =&gt;
+  Task {
+    <span class="co">// do something with eventWriter</span>
+    ()
+  }
+}</code></pre></div>
+<p>The <code>app</code> value is a program that, when executed, will execute the <code>apply</code> function of <code>kinesis</code> (that is, <code>r1</code> in <code>flatMap</code>) with a <code>use</code> function that is created by applying <code>event</code> to the created <code>KinesisWriter</code>, which is then applied to the supplied <code>app</code> body.</p>
+<p>Whew! It’s mind bending, but it works. Since we composed the usage actions as before, in a nested fashion, the cleanup handlers will also be executed correctly, in reverse order of acquisition. The <code>ManagedT</code> data type and its monad instance for <code>cats</code> is available <a href="https://github.com/iravid/managedt">here</a>.</p>
+<h1 id="yay-composition">Yay, composition!</h1>
+<p>With just the <a href="https://github.com/iravid/managedt/blob/master/core/src/main/scala/com/iravid/managedt/ManagedT.scala#L61-L86">25 lines</a> that it takes to define the monad instance, we get a whole host of incredible combinators. We’ve seen <code>flatMap</code> - that means we can do for-comprehensions with <code>ManagedT</code> values. But that’s mundane, so I won’t bore you with that.</p>
+<p>How about applicative composition? You’ve got two independent resources, and want to use them? Sure thing:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala">
+<span class="kw">trait</span> KafkaWriter {
+  <span class="kw">def</span> close: Task[Unit] = Task.<span class="fu">unit</span>
+}
+<span class="kw">object</span> KafkaWriter {
+  <span class="kw">def</span> acquire: Task[KafkaWriter] = <span class="fu">Task</span>(<span class="kw">new</span> KafkaWriter {})
+}</code></pre></div>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">import</span> com.<span class="fu">iravid</span>.<span class="fu">managedt</span>.<span class="fu">ManagedT</span>
+<span class="co">// import com.iravid.managedt.ManagedT</span>
+
+<span class="kw">val</span> zipped = (<span class="fu">ManagedT</span>(KinesisWriter.<span class="fu">acquire</span>)(_.<span class="fu">close</span>), 
+              <span class="fu">ManagedT</span>(KafkaWriter.<span class="fu">acquire</span>)(_.<span class="fu">close</span>)).<span class="fu">tupled</span>
+<span class="co">// zipped: com.iravid.managedt.ManagedT[monix.eval.Task,(KinesisWriter, KafkaWriter)] = com.iravid.managedt.ManagedT$$anon$1$$anon$5@218a2462</span></code></pre></div>
+<p><code>zipped</code> will acquire and release both the <code>KafkaWriter</code> and <code>KinesisWriter</code> properly. Incidentally, it will do so in order of declaration, but that shouldn’t matter as they are independent. Need to initialize a list of resources of a size only known at runtime? No worries, we’ve got you covered:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">def</span> <span class="fu">acquireNamed</span>(name: String): Task[KafkaWriter] = KafkaWriter.<span class="fu">acquire</span>
+<span class="co">// acquireNamed: (name: String)monix.eval.Task[KafkaWriter]</span>
+
+<span class="kw">val</span> writers = List(<span class="st">&quot;a&quot;</span>, <span class="st">&quot;b&quot;</span>, <span class="st">&quot;c&quot;</span>) traverse acquireNamed
+<span class="co">// writers: monix.eval.Task[List[KafkaWriter]] = Task.FlatMap$837147664</span></code></pre></div>
+<p>Yes, they’ll be acquired as they are specified in the list, and released in reverse order. That trick also works for <code>Option</code> and <code>Either</code>, if you’ve got a resource that should only conditionally be initialized.</p>
+<p>There’s also a <code>Monoid</code> instance for <code>ManagedT</code>, if you’ve got a resource that has a <code>Monoid</code> instance. You can combine the managed values as much as you like, and the cleanup actions will still be executed:</p>
+<div class="sourceCode"><pre class="sourceCode scala"><code class="sourceCode scala"><span class="kw">def</span> <span class="fu">resource</span>(i: Int) = <span class="fu">ManagedT</span>(Task { 
+  <span class="fu">println</span>(s<span class="st">&quot;Acquiring ${i}&quot;</span>)
+  i 
+})(_ =&gt; <span class="fu">Task</span>(<span class="fu">println</span>(s<span class="st">&quot;Releasing $i&quot;</span>)))
+<span class="co">// resource: (i: Int)com.iravid.managedt.ManagedT[monix.eval.Task,Int]</span>
+
+<span class="kw">val</span> squashed = (<span class="dv">1</span> to <span class="dv">5</span>).<span class="fu">toList</span>.<span class="fu">foldMap</span>(resource)
+<span class="co">// squashed: com.iravid.managedt.ManagedT[monix.eval.Task,Int] = com.iravid.managedt.ManagedT$$anon$1$$anon$5@37df48a4</span>
+
+<span class="kw">val</span> sum = <span class="fu">squashed</span>(sum =&gt; <span class="fu">Task</span>(<span class="fu">println</span>(s<span class="st">&quot;Got $sum&quot;</span>)))
+<span class="co">// sum: monix.eval.Task[Unit] = Task.FlatMap$2133665162</span>
+
+<span class="kw">import</span> monix.<span class="fu">execution</span>.<span class="fu">Scheduler</span>.<span class="fu">Implicits</span>.<span class="fu">global</span>
+<span class="co">// import monix.execution.Scheduler.Implicits.global</span>
+
+<span class="kw">import</span> scala.<span class="fu">concurrent</span>.<span class="fu">Await</span>, scala.<span class="fu">concurrent</span>.<span class="fu">duration</span>._
+<span class="co">// import scala.concurrent.Await</span>
+<span class="co">// import scala.concurrent.duration._</span>
+
+Await.<span class="fu">result</span>(sum.<span class="fu">runAsync</span>, <span class="fl">1.</span>second)
+<span class="co">// Acquiring 1</span>
+<span class="co">// Acquiring 2</span>
+<span class="co">// Acquiring 3</span>
+<span class="co">// Acquiring 4</span>
+<span class="co">// Acquiring 5</span>
+<span class="co">// Got 15</span>
+<span class="co">// Releasing 5</span>
+<span class="co">// Releasing 4</span>
+<span class="co">// Releasing 3</span>
+<span class="co">// Releasing 2</span>
+<span class="co">// Releasing 1</span></code></pre></div>
+<p>It’s amazing that 25 lines unlock so much power. This is what I like about functional programming: it’s a programmer’s dream come true; write a measly amount of code, get back a boatload of reusable functionality.</p>
+<h1 id="summary">Summary</h1>
+<p><code>ManagedT</code> is <a href="https://github.com/iravid/managedt">usable today</a> as a way to elegantly compose resource acquisition in your application. There are a few caveats, though; they are detailed in the README, but the biggest one is that <code>MonadError</code> cannot be used if the underlying <code>F</code> is an effect that models cancellable computations. <code>monix.eval.Task</code> supports cancellation, so all bets are off if you cancel your cleanup handlers.</p>
+<p><code>cats-effect</code> is <a href="https://github.com/typelevel/cats-effect/pull/113">about to add</a> the <code>MonadBracket</code> typeclass. When that happens, the <code>MonadError</code> constraint will be replaced with that and we should get stronger guarantess for the cleanup actions.</p>
+<p>Enjoy!</p>
+</section>
+
+    </body>
+</html>
